@@ -1,8 +1,8 @@
 Source Files/build/
 Source Files/dist/
 Source Files/src/__pycache__/
+MediaDownloader.exe
 *.pyc
 *.pyo
 *.pyd
 *.log
-
