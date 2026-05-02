@@ -11,6 +11,7 @@ A small Windows media downloader GUI for saving videos, audio, GIFs, and playlis
 - Download playlists into named folders.
 - Cancel active downloads.
 - Blocks Spotify links because Spotify offline downloads must be handled inside Spotify's own app.
+- Checks GitHub Releases on startup and replaces itself when a newer release is available.
 
 ## Source
 

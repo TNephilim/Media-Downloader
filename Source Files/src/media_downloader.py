@@ -1,14 +1,18 @@
+import json
 import os
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 import tempfile
 from pathlib import Path
 from tkinter import ttk
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import imageio_ffmpeg
 import yt_dlp
@@ -16,6 +20,9 @@ from yt_dlp.utils import DownloadCancelled, sanitize_filename
 
 
 APP_NAME = "Media Downloader"
+APP_VERSION = "1.0.0"
+GITHUB_REPO = "TNephilim/media-downloader"
+RELEASE_ASSET_NAME = "MediaDownloader.exe"
 DOWNLOAD_DIR = Path.home() / "Downloads"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 MEDIA_SOURCE_SUFFIXES = {
@@ -55,6 +62,7 @@ class DownloadApp(tk.Tk):
 
         self._configure_styles()
         self._build_ui()
+        self.after(1000, self._check_for_updates)
         self.after(100, self._process_events)
 
     def _configure_styles(self):
@@ -290,6 +298,29 @@ class DownloadApp(tk.Tk):
         except Exception as exc:
             self.events.put(("error", str(exc)))
 
+    def _check_for_updates(self):
+        if not getattr(sys, "frozen", False):
+            return
+
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        try:
+            release = fetch_latest_release()
+            latest_version = release.get("tag_name", "")
+            if not is_newer_version(latest_version, APP_VERSION):
+                return
+
+            asset = find_release_asset(release, RELEASE_ASSET_NAME)
+            if not asset:
+                return
+
+            self.events.put(("status", f"Updating to {latest_version}..."))
+            downloaded_exe = download_update_asset(asset["browser_download_url"])
+            self.events.put(("update_ready", latest_version, str(downloaded_exe)))
+        except (OSError, URLError, ValueError, KeyError, json.JSONDecodeError):
+            return
+
     def _progress_hook(self, data):
         if self.cancel_event.is_set():
             raise DownloadCancelled("Download cancelled.")
@@ -346,6 +377,11 @@ class DownloadApp(tk.Tk):
                     if "Converting" in event[1]:
                         self._set_phase("converting")
                     self._set_status(event[1])
+                elif kind == "update_ready":
+                    self._set_status(f"Installing update {event[1]}...")
+                    install_update_and_restart(Path(event[2]))
+                    self.destroy()
+                    return
                 elif kind == "done":
                     self.progress_var.set(100)
                     self._set_phase("done")
@@ -514,6 +550,68 @@ def validate_urls(urls):
                 "must be done inside the Spotify app."
             )
     return None
+
+
+def fetch_latest_release():
+    request = Request(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        },
+    )
+    with urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def is_newer_version(latest, current):
+    return parse_version(latest) > parse_version(current)
+
+
+def parse_version(version):
+    cleaned = version.strip().lower().lstrip("v")
+    parts = []
+    for part in cleaned.split("."):
+        digits = "".join(char for char in part if char.isdigit())
+        parts.append(int(digits or 0))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def find_release_asset(release, asset_name):
+    for asset in release.get("assets", []):
+        if asset.get("name") == asset_name and asset.get("browser_download_url"):
+            return asset
+    return None
+
+
+def download_update_asset(url):
+    update_path = Path(tempfile.gettempdir()) / RELEASE_ASSET_NAME
+    request = Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    with urlopen(request, timeout=60) as response, update_path.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    return update_path
+
+
+def install_update_and_restart(downloaded_exe):
+    current_exe = Path(sys.executable)
+    script = Path(tempfile.gettempdir()) / "media_downloader_update.cmd"
+    script.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                "timeout /t 2 /nobreak >nul",
+                f'copy /y "{downloaded_exe}" "{current_exe}" >nul',
+                f'start "" "{current_exe}"',
+                f'del "{downloaded_exe}" >nul 2>nul',
+                'del "%~f0" >nul 2>nul',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    subprocess.Popen([str(script)], shell=True, creationflags=creationflags)
 
 
 def make_ydl_options(
