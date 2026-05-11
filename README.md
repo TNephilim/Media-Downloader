@@ -15,12 +15,12 @@ A small Windows media downloader GUI for saving videos, audio, GIFs, and playlis
 
 ## Source
 
-The Python source and PyInstaller spec are in `Source Files/`.
+The Python source and PyInstaller spec are in `Source Code/`.
 
 ## Build
 
 ```powershell
-pyinstaller --onefile --windowed --name MediaDownloader --specpath 'Source Files' --workpath 'Source Files\build' --distpath 'Source Files\dist' 'Source Files\src\media_downloader.py'
+pyinstaller --onefile --windowed --name MediaDownloader --specpath 'Source Code' --workpath 'Source Code\build' --distpath 'Source Code\dist' 'Source Code\src\media_downloader.py'
 ```
 
 The built app is `MediaDownloader.exe`.
