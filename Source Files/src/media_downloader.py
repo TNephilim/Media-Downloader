@@ -16,11 +16,11 @@ from urllib.request import Request, urlopen
 
 import imageio_ffmpeg
 import yt_dlp
-from yt_dlp.utils import DownloadCancelled, sanitize_filename
+from yt_dlp.utils import DownloadCancelled, DownloadError, sanitize_filename
 
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "TNephilim/media-downloader"
 RELEASE_ASSET_NAME = "MediaDownloader.exe"
 DOWNLOAD_DIR = Path.home() / "Downloads"
@@ -529,10 +529,18 @@ class DownloadApp(tk.Tk):
 def extract_urls(text):
     urls = []
     for match in URL_PATTERN.findall(text):
-        url = match.rstrip(").,;]'\"")
+        url = normalize_media_url(match.rstrip(").,;]'\""))
         if url not in urls:
             urls.append(url)
     return urls
+
+
+def normalize_media_url(url):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host == "x.com" or host.endswith(".x.com"):
+        return url.replace(parsed.netloc, "twitter.com", 1)
+    return url
 
 
 def validate_urls(urls):
@@ -644,7 +652,7 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event):
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback)
+        target = resolve_download_target(url, status_callback, "video")
         check_cancelled(cancel_event)
         output_template = target["directory"] / output_filename_template(target["is_collection"])
         options = make_ydl_options(
@@ -660,7 +668,7 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event):
             status_callback("Downloading best available video...")
 
         with yt_dlp.YoutubeDL(options) as ydl:
-            code = ydl.download([url])
+            code = ydl.download([target["url"]])
         if code:
             raise RuntimeError("One or more downloads failed.")
         saved_locations.append(target["directory"])
@@ -672,7 +680,7 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback)
+        target = resolve_download_target(url, status_callback, "gif")
         check_cancelled(cancel_event)
         with tempfile.TemporaryDirectory(prefix="media-downloader-") as temp_dir:
             temp_dir_path = Path(temp_dir)
@@ -690,7 +698,7 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
                 status_callback("Downloading source media for GIF conversion...")
 
             with yt_dlp.YoutubeDL(options) as ydl:
-                code = ydl.download([url])
+                code = ydl.download([target["url"]])
             if code:
                 raise RuntimeError("One or more downloads failed before GIF conversion.")
 
@@ -718,7 +726,7 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback)
+        target = resolve_download_target(url, status_callback, "audio")
         check_cancelled(cancel_event)
         with tempfile.TemporaryDirectory(prefix="media-downloader-") as temp_dir:
             temp_dir_path = Path(temp_dir)
@@ -736,7 +744,7 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
                 status_callback("Downloading audio for MP3 conversion...")
 
             with yt_dlp.YoutubeDL(options) as ydl:
-                code = ydl.download([url])
+                code = ydl.download([target["url"]])
             if code:
                 raise RuntimeError("One or more downloads failed before MP3 conversion.")
 
@@ -795,27 +803,98 @@ def check_cancelled(cancel_event):
         raise DownloadCancelled("Download cancelled.")
 
 
-def resolve_download_target(url, status_callback):
+def resolve_download_target(url, status_callback, mode):
+    normalized_url = normalize_media_url(url)
     status_callback("Scanning link details...")
-    info = extract_download_info(url)
+    try:
+        info = extract_download_info(normalized_url)
+    except DownloadError as exc:
+        raise RuntimeError(media_detection_error(normalized_url, mode, exc)) from exc
+
+    if not has_media_for_mode(info, mode):
+        raise RuntimeError(no_media_message(normalized_url, mode))
+
     collection_name = collection_title(info)
     if collection_name:
         directory = unique_path(DOWNLOAD_DIR / safe_folder_name(collection_name))
         directory.mkdir(parents=True, exist_ok=True)
-        return {"directory": directory, "is_collection": True, "name": collection_name}
+        return {"directory": directory, "is_collection": True, "name": collection_name, "url": normalized_url}
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None}
+    return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": normalized_url}
 
 
 def extract_download_info(url):
     options = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": "in_playlist",
         "windowsfilenames": True,
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def has_media_for_mode(info, mode):
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if entries:
+        return any(has_media_for_mode(entry, mode) for entry in entries if isinstance(entry, dict))
+
+    formats = info.get("formats") if isinstance(info, dict) else None
+    if not formats:
+        return bool(info.get("url")) if isinstance(info, dict) else False
+
+    if mode in {"video", "gif"}:
+        return any(format_has_video(media_format) for media_format in formats)
+    if mode == "audio":
+        return any(format_has_audio(media_format) for media_format in formats)
+    return bool(formats)
+
+
+def format_has_video(media_format):
+    video_codec = media_format.get("vcodec")
+    return video_codec not in {None, "none"}
+
+
+def format_has_audio(media_format):
+    audio_codec = media_format.get("acodec")
+    return audio_codec not in {None, "none"}
+
+
+def media_detection_error(url, mode, exc):
+    message = str(exc)
+    if is_x_or_twitter_url(url):
+        return (
+            f"No downloadable {mode_label(mode)} was found in this X/Twitter post. "
+            "It may be text-only, image-only, private, deleted, age-restricted, or require login. "
+            "This app can only download media that yt-dlp can access without your browser session."
+        )
+    if "No video" in message or "Unsupported URL" in message:
+        return (
+            f"No downloadable {mode_label(mode)} was found at this link. "
+            "The page may not contain supported media, or it may require login."
+        )
+    return clean_download_error(message)
+
+
+def no_media_message(url, mode):
+    if is_x_or_twitter_url(url):
+        return (
+            f"This X/Twitter post does not appear to contain downloadable {mode_label(mode)}. "
+            "Posts with only images/text are not supported by the Video, GIF, or Audio buttons."
+        )
+    return f"This link does not appear to contain downloadable {mode_label(mode)}."
+
+
+def mode_label(mode):
+    return {"gif": "video for GIF conversion", "audio": "audio", "video": "video"}.get(mode, "media")
+
+
+def is_x_or_twitter_url(url):
+    host = urlparse(url).netloc.lower()
+    return host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com")
+
+
+def clean_download_error(message):
+    return re.sub(r"^ERROR:\s*", "", message).strip() or "The downloader could not read media from this link."
 
 
 def collection_title(info):
