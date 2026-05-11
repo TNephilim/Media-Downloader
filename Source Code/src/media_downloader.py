@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from tkinter import ttk
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 import imageio_ffmpeg
@@ -20,9 +20,10 @@ from yt_dlp.utils import DownloadCancelled, DownloadError, sanitize_filename
 
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "TNephilim/media-downloader"
 RELEASE_ASSET_NAME = "MediaDownloader.exe"
+TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 MEDIA_SOURCE_SUFFIXES = {
@@ -667,10 +668,14 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event):
         else:
             status_callback("Downloading best available video...")
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            code = ydl.download([target["url"]])
-        if code:
-            raise RuntimeError("One or more downloads failed.")
+        if target.get("direct_media_url"):
+            output_path = target["directory"] / direct_media_filename(target, ".mp4")
+            download_direct_media(target["direct_media_url"], output_path)
+        else:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                code = ydl.download([target["url"]])
+            if code:
+                raise RuntimeError("One or more downloads failed.")
         saved_locations.append(target["directory"])
     return format_saved_locations(saved_locations)
 
@@ -697,10 +702,14 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
             else:
                 status_callback("Downloading source media for GIF conversion...")
 
-            with yt_dlp.YoutubeDL(options) as ydl:
-                code = ydl.download([target["url"]])
-            if code:
-                raise RuntimeError("One or more downloads failed before GIF conversion.")
+            if target.get("direct_media_url"):
+                source = temp_dir_path / direct_media_filename(target, ".source.mp4")
+                download_direct_media(target["direct_media_url"], source)
+            else:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    code = ydl.download([target["url"]])
+                if code:
+                    raise RuntimeError("One or more downloads failed before GIF conversion.")
 
             source_files = sorted(
                 path
@@ -743,10 +752,14 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
             else:
                 status_callback("Downloading audio for MP3 conversion...")
 
-            with yt_dlp.YoutubeDL(options) as ydl:
-                code = ydl.download([target["url"]])
-            if code:
-                raise RuntimeError("One or more downloads failed before MP3 conversion.")
+            if target.get("direct_media_url"):
+                source = temp_dir_path / direct_media_filename(target, ".source.mp4")
+                download_direct_media(target["direct_media_url"], source)
+            else:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    code = ydl.download([target["url"]])
+                if code:
+                    raise RuntimeError("One or more downloads failed before MP3 conversion.")
 
             source_files = sorted(
                 path
@@ -809,9 +822,17 @@ def resolve_download_target(url, status_callback, mode):
     try:
         info = extract_download_info(normalized_url)
     except DownloadError as exc:
+        if is_x_or_twitter_url(normalized_url):
+            fallback = extract_twitter_fallback(normalized_url)
+            if fallback:
+                return direct_download_target(normalized_url, fallback)
         raise RuntimeError(media_detection_error(normalized_url, mode, exc)) from exc
 
     if not has_media_for_mode(info, mode):
+        if is_x_or_twitter_url(normalized_url):
+            fallback = extract_twitter_fallback(normalized_url)
+            if fallback:
+                return direct_download_target(normalized_url, fallback)
         raise RuntimeError(no_media_message(normalized_url, mode))
 
     collection_name = collection_title(info)
@@ -823,6 +844,18 @@ def resolve_download_target(url, status_callback, mode):
     return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": normalized_url}
 
 
+def direct_download_target(url, fallback):
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    return {
+        "directory": DOWNLOAD_DIR,
+        "is_collection": False,
+        "name": fallback.get("title") or twitter_status_id(url) or "Twitter media",
+        "url": url,
+        "direct_media_url": fallback["video_url"],
+        "id": twitter_status_id(url) or "twitter",
+    }
+
+
 def extract_download_info(url):
     options = {
         "quiet": True,
@@ -831,6 +864,52 @@ def extract_download_info(url):
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def extract_twitter_fallback(url):
+    tweet_id = twitter_status_id(url)
+    if not tweet_id:
+        return None
+
+    request = Request(
+        TWITIGER_EXTRACT_URL + quote(url, safe=""),
+        headers={
+            "Accept": "application/json",
+            "Referer": "https://twitiger.com/",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError):
+        return None
+
+    data = payload.get("data") if payload.get("success") else None
+    if not isinstance(data, dict):
+        return None
+
+    media_url = best_twitter_fallback_url(data)
+    if not media_url:
+        return None
+
+    return {
+        "title": data.get("title") or f"Twitter media {tweet_id}",
+        "video_url": media_url,
+    }
+
+
+def best_twitter_fallback_url(data):
+    resolutions = data.get("resolutions") or []
+    for item in resolutions:
+        if isinstance(item, dict) and item.get("videoUrl"):
+            return item["videoUrl"]
+    return data.get("videoUrl") or data.get("downloadUrl")
+
+
+def twitter_status_id(url):
+    match = re.search(r"/(?:i/)?status(?:es)?/(\d+)", url)
+    return match.group(1) if match else None
 
 
 def has_media_for_mode(info, mode):
@@ -925,6 +1004,26 @@ def format_saved_locations(locations):
     if len(unique_locations) == 1:
         return str(unique_locations[0])
     return ", ".join(str(location) for location in unique_locations)
+
+
+def direct_media_filename(target, suffix):
+    title = safe_folder_name(target.get("name") or "Twitter media")
+    media_id = target.get("id") or "twitter"
+    return unique_path(Path(f"{title[:120]} [{media_id}]{suffix}")).name
+
+
+def download_direct_media(url, output_path):
+    output_path = unique_path(output_path)
+    request = Request(
+        url,
+        headers={
+            "Referer": "https://twitter.com/",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    with urlopen(request, timeout=60) as response, output_path.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    return output_path
 
 
 def convert_source_to_gif(source, output_dir):
