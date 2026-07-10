@@ -14,18 +14,16 @@ from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-import imageio_ffmpeg
-import yt_dlp
-from yt_dlp.utils import DownloadCancelled, DownloadError, sanitize_filename
-
-
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPO = "TNephilim/media-downloader"
 RELEASE_ASSET_NAME = "MediaDownloader.exe"
 TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
+_YT_DLP = None
+_YT_DLP_UTILS = None
+_IMAGEIO_FFMPEG = None
 MEDIA_SOURCE_SUFFIXES = {
     ".aac",
     ".flac",
@@ -294,7 +292,7 @@ class DownloadApp(tk.Tk):
             else:
                 output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event)
             self.events.put(("done", f"Saved: {output}"))
-        except DownloadCancelled:
+        except get_download_cancelled():
             self.events.put(("cancelled", "Download cancelled."))
         except Exception as exc:
             self.events.put(("error", str(exc)))
@@ -324,7 +322,7 @@ class DownloadApp(tk.Tk):
 
     def _progress_hook(self, data):
         if self.cancel_event.is_set():
-            raise DownloadCancelled("Download cancelled.")
+            raise get_download_cancelled()("Download cancelled.")
 
         self._sync_download_position(data)
 
@@ -561,6 +559,37 @@ def validate_urls(urls):
     return None
 
 
+def get_yt_dlp():
+    global _YT_DLP
+    if _YT_DLP is None:
+        import yt_dlp
+
+        _YT_DLP = yt_dlp
+    return _YT_DLP
+
+
+def get_ytdlp_utils():
+    global _YT_DLP_UTILS
+    if _YT_DLP_UTILS is None:
+        import yt_dlp.utils
+
+        _YT_DLP_UTILS = yt_dlp.utils
+    return _YT_DLP_UTILS
+
+
+def get_download_cancelled():
+    return get_ytdlp_utils().DownloadCancelled
+
+
+def get_imageio_ffmpeg():
+    global _IMAGEIO_FFMPEG
+    if _IMAGEIO_FFMPEG is None:
+        import imageio_ffmpeg
+
+        _IMAGEIO_FFMPEG = imageio_ffmpeg
+    return _IMAGEIO_FFMPEG
+
+
 def fetch_latest_release():
     request = Request(
         f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -672,7 +701,7 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event):
             output_path = target["directory"] / direct_media_filename(target, ".mp4")
             download_direct_media(target["direct_media_url"], output_path)
         else:
-            with yt_dlp.YoutubeDL(options) as ydl:
+            with get_yt_dlp().YoutubeDL(options) as ydl:
                 code = ydl.download([target["url"]])
             if code:
                 raise RuntimeError("One or more downloads failed.")
@@ -706,7 +735,7 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
                 source = temp_dir_path / direct_media_filename(target, ".source.mp4")
                 download_direct_media(target["direct_media_url"], source)
             else:
-                with yt_dlp.YoutubeDL(options) as ydl:
+                with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
                 if code:
                     raise RuntimeError("One or more downloads failed before GIF conversion.")
@@ -756,7 +785,7 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
                 source = temp_dir_path / direct_media_filename(target, ".source.mp4")
                 download_direct_media(target["direct_media_url"], source)
             else:
-                with yt_dlp.YoutubeDL(options) as ydl:
+                with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
                 if code:
                     raise RuntimeError("One or more downloads failed before MP3 conversion.")
@@ -783,7 +812,7 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
 def download_best_gif(url, progress_hook, status_callback):
     temp_template = DOWNLOAD_DIR / "%(title).120B [%(id)s].source.%(ext)s"
     options = make_ydl_options(progress_hook, temp_template, allow_playlists=False)
-    with yt_dlp.YoutubeDL(options) as ydl:
+    with get_yt_dlp().YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         source = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
         if not source.exists():
@@ -813,7 +842,7 @@ def output_source_filename_template(is_collection):
 
 def check_cancelled(cancel_event):
     if cancel_event.is_set():
-        raise DownloadCancelled("Download cancelled.")
+        raise get_download_cancelled()("Download cancelled.")
 
 
 def resolve_download_target(url, status_callback, mode):
@@ -821,7 +850,7 @@ def resolve_download_target(url, status_callback, mode):
     status_callback("Scanning link details...")
     try:
         info = extract_download_info(normalized_url)
-    except DownloadError as exc:
+    except Exception as exc:
         if is_x_or_twitter_url(normalized_url):
             fallback = extract_twitter_fallback(normalized_url)
             if fallback:
@@ -862,7 +891,7 @@ def extract_download_info(url):
         "no_warnings": True,
         "windowsfilenames": True,
     }
-    with yt_dlp.YoutubeDL(options) as ydl:
+    with get_yt_dlp().YoutubeDL(options) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -990,7 +1019,7 @@ def collection_title(info):
 
 
 def safe_folder_name(name):
-    cleaned = sanitize_filename(name, restricted=False).strip(" .")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return cleaned or "Media Download"
 
 
@@ -1115,7 +1144,7 @@ def find_ffmpeg_exe():
     candidates = []
 
     try:
-        candidates.append(Path(imageio_ffmpeg.get_ffmpeg_exe()))
+        candidates.append(Path(get_imageio_ffmpeg().get_ffmpeg_exe()))
     except Exception:
         pass
 
