@@ -1,8 +1,0 @@
-Source Code/build/
-Source Code/dist/
-Source Code/src/__pycache__/
-MediaDownloader.exe
-*.pyc
-*.pyo
-*.pyd
-*.log
