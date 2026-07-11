@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import queue
@@ -9,19 +10,59 @@ import threading
 import time
 import tkinter as tk
 import tempfile
+import html
 from pathlib import Path
 from tkinter import filedialog, ttk
 from urllib.error import URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.1.4"
 GITHUB_REPO = "TNephilim/media-downloader"
 RELEASE_ASSET_NAME = "MediaDownloader.exe"
 TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+COMMON_HTTP_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": BROWSER_USER_AGENT,
+}
+MEDIA_URL_RE = re.compile(
+    r"https?://[^\\\"'<>\s]+?\.(?:mp4|webm|mov|mkv|m3u8|mpd)(?:\?[^\\\"'<>\s]*)?",
+    re.IGNORECASE,
+)
+IFRAME_URL_RE = re.compile(
+    r"<iframe[^>]+src=[\"'](?P<src>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+SOURCE_URL_RE = re.compile(
+    r"<(?:source|video|audio)[^>]+src=[\"'](?P<src>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+META_MEDIA_URL_RE = re.compile(
+    r"<meta[^>]+(?:property|name)=[\"'](?:og:video|og:video:url|og:video:secure_url|twitter:player|twitter:player:stream)[\"'][^>]+content=[\"'](?P<src>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+PAGE_SCAN_MAX_CANDIDATES = 10
+BROWSER_DIRECT_CANDIDATE_LIMIT = 4
+BROWSER_SCAN_SECONDS = 8
+BROWSER_SCAN_TIMEOUT_MS = 20000
+DIRECT_MEDIA_CONNECT_TIMEOUT_SECONDS = 15
+DIRECT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 20
+DIRECT_MEDIA_PROBE_TIMEOUT_SECONDS = 12
+HLS_PLAYLIST_PROBE_BYTES = 512_000
+BROWSER_MEDIA_CONTENT_RE = re.compile(
+    r"(video|audio|mpegurl|mpegURL|x-mpegURL|dash\+xml|mp4|webm|quicktime)",
+    re.IGNORECASE,
+)
+BROWSER_STREAM_SEGMENT_RE = re.compile(r"(?:\.ts$|\.m4s$|/segment(?:s)?/|/chunk(?:s)?/|/frag(?:ment)?s?/)", re.IGNORECASE)
 _YT_DLP = None
 _YT_DLP_UTILS = None
 _IMAGEIO_FFMPEG = None
@@ -65,6 +106,7 @@ class DownloadApp(APP_TK_CLASS):
         self.download_total = 0
         self.download_current = 0
         self.download_completed = 0
+        self.progress_is_indeterminate = False
 
         self.phase_var = tk.StringVar(value="READY")
         self.status_var = tk.StringVar(value="No downloads currently")
@@ -310,6 +352,7 @@ class DownloadApp(APP_TK_CLASS):
             return
 
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        self._set_progress_activity(False)
         self.progress_var.set(0)
         self.cancel_event.clear()
         self.download_total = len(urls) + len(local_files)
@@ -336,6 +379,8 @@ class DownloadApp(APP_TK_CLASS):
                 output = download_best_video(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
             elif mode == "gif":
                 output = download_best_gifs(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+            elif mode == "frames":
+                output = download_best_frames(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
             else:
                 output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
             if output:
@@ -373,15 +418,35 @@ class DownloadApp(APP_TK_CLASS):
         if self.cancel_event.is_set():
             raise get_download_cancelled()("Download cancelled.")
 
+        if data.get("status") == "checking":
+            self.events.put(("activity", "Checking media connection..."))
+            return
+        if data.get("status") == "preparing":
+            self.events.put(("activity", "Connecting to media stream..."))
+            return
+
         self._sync_download_position(data)
 
         if data.get("status") == "downloading":
             total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
             downloaded = data.get("downloaded_bytes") or 0
-            percent = (downloaded / total * 100) if total else 0
             speed = data.get("_speed_str", "").strip()
             count = self._download_count_prefix()
-            self.events.put(("progress", percent, f"{count}Downloading... {percent:.1f}% {speed}".strip()))
+            fragment_index = data.get("fragment_index")
+            fragment_count = data.get("fragment_count")
+
+            if total:
+                percent = downloaded / total * 100
+                self.events.put(("progress", percent, f"{count}Downloading... {percent:.1f}% {speed}".strip()))
+            elif isinstance(fragment_index, int) and isinstance(fragment_count, int) and fragment_count > 0:
+                percent = fragment_index / fragment_count * 100
+                self.events.put(
+                    ("progress", percent, f"{count}Downloading stream... {fragment_index}/{fragment_count} parts {speed}".strip())
+                )
+            else:
+                received = format_download_size(downloaded)
+                message = f"{count}Downloading stream... {received} received {speed}".strip()
+                self.events.put(("activity", message))
         elif data.get("status") == "finished":
             count = self._download_count_prefix()
             self.events.put(("progress", 100, f"{count}Processing downloaded media..."))
@@ -419,8 +484,12 @@ class DownloadApp(APP_TK_CLASS):
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "progress":
+                    self._set_progress_activity(False)
                     self.progress_var.set(event[1])
                     self._set_status(event[2])
+                elif kind == "activity":
+                    self._set_progress_activity(True)
+                    self._set_status(event[1])
                 elif kind == "status":
                     if "Converting" in event[1]:
                         self._set_phase("converting")
@@ -431,15 +500,18 @@ class DownloadApp(APP_TK_CLASS):
                     self.destroy()
                     return
                 elif kind == "done":
+                    self._set_progress_activity(False)
                     self.progress_var.set(100)
                     self._set_phase("done")
                     self._set_status(event[1])
                     self._set_busy(False)
                 elif kind == "cancelled":
+                    self._set_progress_activity(False)
                     self._set_phase("cancelled")
                     self._set_status(event[1])
                     self._set_busy(False)
                 elif kind == "error":
+                    self._set_progress_activity(False)
                     self._set_phase("error")
                     self._set_status("Download failed.")
                     self._set_busy(False)
@@ -455,6 +527,17 @@ class DownloadApp(APP_TK_CLASS):
         self.gif_button.configure(state=state)
         self.choose_button.configure(state=state)
         self.cancel_button.configure(state=tk.NORMAL if busy else tk.DISABLED)
+
+    def _set_progress_activity(self, active):
+        if active == self.progress_is_indeterminate:
+            return
+        self.progress_is_indeterminate = active
+        if active:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
 
     def _set_status(self, text):
         self.status_var.set(text or "No downloads currently")
@@ -722,9 +805,11 @@ def make_ydl_options(
     progress_hook,
     output_template,
     allow_playlists=True,
-    format_selector="bv*+ba/best",
+    format_selector="bv*+ba/b",
     format_sort=None,
     merge_output_format="mp4",
+    http_headers=None,
+    cookies_from_browser=None,
 ):
     ffmpeg_exe = find_ffmpeg_exe()
     options = {
@@ -736,7 +821,15 @@ def make_ydl_options(
         "no_warnings": True,
         "progress_hooks": [progress_hook],
         "windowsfilenames": True,
+        "http_headers": http_headers or COMMON_HTTP_HEADERS,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "geo_bypass": True,
+        "socket_timeout": 20,
     }
+    if cookies_from_browser:
+        options["cookiesfrombrowser"] = cookies_from_browser
     if format_sort:
         options["format_sort"] = format_sort
     if merge_output_format:
@@ -754,19 +847,23 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event):
         options = make_ydl_options(
             progress_hook,
             output_template,
-            format_sort=["res", "fps", "br"],
             merge_output_format="mp4",
+            http_headers=target.get("http_headers"),
+            cookies_from_browser=target.get("cookies_from_browser"),
         )
 
         if target["is_collection"]:
             status_callback(f"Downloading {target['name']} into {target['directory'].name}...")
+        elif target.get("direct_media_url"):
+            source = target.get("source") or "media scan"
+            status_callback(f"Found media from {source}. Downloading stream...")
         else:
             status_callback("Downloading best available video...")
 
         started_at = time.time()
         if target.get("direct_media_url"):
             output_path = target["directory"] / direct_media_filename(target, ".mp4")
-            download_direct_media(target["direct_media_url"], output_path, progress_hook)
+            download_direct_media(target["direct_media_url"], output_path, progress_hook, target.get("http_headers"))
             status_callback("Repairing video timestamps...")
             remux_video_lossless(output_path)
         else:
@@ -787,7 +884,12 @@ def process_local_files(files, mode, status_callback, cancel_event):
         check_cancelled(cancel_event)
         suffix = file_path.suffix.lower()
 
-        if mode == "video":
+        if mode == "frames":
+            if suffix not in VIDEO_SOURCE_SUFFIXES and suffix != ".gif":
+                raise RuntimeError(f"{file_path.name} is not a supported GIF or video file for frame extraction.")
+            status_callback(f"Extracting frames {index}/{total}...")
+            outputs.append(extract_unique_frames(file_path, DOWNLOAD_DIR))
+        elif mode == "video":
             if suffix == ".gif":
                 status_callback(f"Converting GIF to video {index}/{total}...")
                 outputs.append(convert_gif_to_video(file_path, file_path.parent))
@@ -825,8 +927,9 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_sort=["res", "fps", "br"],
                 merge_output_format="mp4",
+                http_headers=target.get("http_headers"),
+                cookies_from_browser=target.get("cookies_from_browser"),
             )
 
             if target["is_collection"]:
@@ -836,7 +939,8 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
 
             if target.get("direct_media_url"):
                 source = temp_dir_path / direct_media_filename(target, ".source.mp4")
-                download_direct_media(target["direct_media_url"], source, progress_hook)
+                status_callback("Found media stream. Downloading source for GIF conversion...")
+                download_direct_media(target["direct_media_url"], source, progress_hook, target.get("http_headers"))
             else:
                 with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
@@ -877,6 +981,8 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
                 temp_template,
                 format_selector="ba/bestaudio/best",
                 merge_output_format=None,
+                http_headers=target.get("http_headers"),
+                cookies_from_browser=target.get("cookies_from_browser"),
             )
 
             if target["is_collection"]:
@@ -886,7 +992,8 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
 
             if target.get("direct_media_url"):
                 source = temp_dir_path / direct_media_filename(target, ".source.mp4")
-                download_direct_media(target["direct_media_url"], source, progress_hook)
+                status_callback("Found media stream. Downloading source for audio conversion...")
+                download_direct_media(target["direct_media_url"], source, progress_hook, target.get("http_headers"))
             else:
                 with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
@@ -910,6 +1017,55 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
             saved_locations.append(target["directory"])
 
     return f"{format_saved_locations(saved_locations)} ({converted} MP3 file{'s' if converted != 1 else ''})"
+
+
+def download_best_frames(urls, progress_hook, status_callback, cancel_event):
+    frame_folders = []
+    for url in urls:
+        check_cancelled(cancel_event)
+        target = resolve_download_target(url, status_callback, "video")
+        check_cancelled(cancel_event)
+        with tempfile.TemporaryDirectory(prefix="media-downloader-") as temp_dir:
+            temp_dir_path = Path(temp_dir)
+            temp_template = temp_dir_path / output_source_filename_template(target["is_collection"])
+            options = make_ydl_options(
+                progress_hook,
+                temp_template,
+                merge_output_format="mp4",
+                http_headers=target.get("http_headers"),
+                cookies_from_browser=target.get("cookies_from_browser"),
+            )
+
+            if target["is_collection"]:
+                status_callback(f"Downloading {target['name']} source media for frame extraction...")
+            else:
+                status_callback("Downloading source media for frame extraction...")
+
+            if target.get("direct_media_url"):
+                source = temp_dir_path / direct_media_filename(target, ".source.mp4")
+                status_callback("Found media stream. Downloading source for frame extraction...")
+                download_direct_media(target["direct_media_url"], source, progress_hook, target.get("http_headers"))
+            else:
+                with get_yt_dlp().YoutubeDL(options) as ydl:
+                    code = ydl.download([target["url"]])
+                if code:
+                    raise RuntimeError("One or more downloads failed before frame extraction.")
+
+            source_files = sorted(
+                path
+                for path in temp_dir_path.rglob("*")
+                if path.is_file() and path.suffix.lower() in (VIDEO_SOURCE_SUFFIXES | {".gif"})
+            )
+            if not source_files:
+                raise RuntimeError("No downloaded GIF or video files were found for frame extraction.")
+
+            total = len(source_files)
+            for index, source in enumerate(source_files, start=1):
+                check_cancelled(cancel_event)
+                status_callback(f"Extracting unique frames {index}/{total}...")
+                frame_folders.append(extract_unique_frames(source, target["directory"]))
+
+    return f"{format_saved_locations(frame_folders)} ({len(frame_folders)} frame folder{'s' if len(frame_folders) != 1 else ''})"
 
 
 def download_best_gif(url, progress_hook, status_callback):
@@ -951,13 +1107,19 @@ def check_cancelled(cancel_event):
 def resolve_download_target(url, status_callback, mode):
     normalized_url = normalize_media_url(url)
     status_callback("Scanning link details...")
+    extraction_error = None
     try:
         info = extract_download_info(normalized_url)
     except Exception as exc:
+        extraction_error = exc
         if is_x_or_twitter_url(normalized_url):
             fallback = extract_twitter_fallback(normalized_url)
             if fallback:
                 return direct_download_target(normalized_url, fallback)
+        status_callback("Scanning page for embedded media...")
+        fallback_target = resolve_page_fallback_target(normalized_url, mode, status_callback)
+        if fallback_target:
+            return fallback_target
         raise RuntimeError(media_detection_error(normalized_url, mode, exc)) from exc
 
     if not has_media_for_mode(info, mode):
@@ -965,19 +1127,46 @@ def resolve_download_target(url, status_callback, mode):
             fallback = extract_twitter_fallback(normalized_url)
             if fallback:
                 return direct_download_target(normalized_url, fallback)
+        status_callback("Scanning page for embedded media...")
+        fallback_target = resolve_page_fallback_target(normalized_url, mode, status_callback)
+        if fallback_target:
+            return fallback_target
+        if extraction_error:
+            raise RuntimeError(media_detection_error(normalized_url, mode, extraction_error)) from extraction_error
         raise RuntimeError(no_media_message(normalized_url, mode))
 
+    return target_from_info(normalized_url, info)
+
+
+def target_from_info(url, info, http_headers=None, cookies_from_browser=None):
+    if cookies_from_browser is None and isinstance(info, dict):
+        cookies_from_browser = info.get("_media_downloader_cookies_from_browser")
     collection_name = collection_title(info)
     if collection_name:
         directory = unique_path(DOWNLOAD_DIR / safe_folder_name(collection_name))
         directory.mkdir(parents=True, exist_ok=True)
-        return {"directory": directory, "is_collection": True, "name": collection_name, "url": normalized_url}
+        return {
+            "directory": directory,
+            "is_collection": True,
+            "name": collection_name,
+            "url": url,
+            "http_headers": http_headers,
+            "cookies_from_browser": cookies_from_browser,
+        }
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": normalized_url}
+    return {
+        "directory": DOWNLOAD_DIR,
+        "is_collection": False,
+        "name": None,
+        "url": url,
+        "http_headers": http_headers,
+        "cookies_from_browser": cookies_from_browser,
+    }
 
 
 def direct_download_target(url, fallback):
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    headers = media_request_headers(url)
     return {
         "directory": DOWNLOAD_DIR,
         "is_collection": False,
@@ -985,17 +1174,402 @@ def direct_download_target(url, fallback):
         "url": url,
         "direct_media_url": fallback["video_url"],
         "id": twitter_status_id(url) or "twitter",
+        "http_headers": headers,
+        "source": "X/Twitter fallback",
     }
 
 
 def extract_download_info(url):
+    errors = []
+    for cookies_from_browser in [None, *available_browser_cookie_sources()]:
+        try:
+            info = extract_download_info_once(url, cookies_from_browser=cookies_from_browser)
+            if isinstance(info, dict) and cookies_from_browser:
+                info["_media_downloader_cookies_from_browser"] = cookies_from_browser
+            return info
+        except Exception as exc:
+            errors.append(exc)
+    raise errors[-1]
+
+
+def extract_download_info_once(url, cookies_from_browser=None, quick=False, http_headers=None):
+    retry_count = 1 if quick else 5
     options = {
         "quiet": True,
         "no_warnings": True,
         "windowsfilenames": True,
+        "http_headers": http_headers or media_request_headers(url),
+        "retries": retry_count,
+        "fragment_retries": retry_count,
+        "extractor_retries": 1 if quick else 3,
+        "geo_bypass": True,
+        "socket_timeout": 8 if quick else 20,
     }
+    if cookies_from_browser:
+        options["cookiesfrombrowser"] = cookies_from_browser
     with get_yt_dlp().YoutubeDL(options) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def resolve_page_fallback_target(url, mode, status_callback=None):
+    title, candidates = discover_page_candidate_urls(url)
+
+    direct_candidates = [candidate for candidate in candidates if is_direct_media_url(candidate)]
+    if direct_candidates:
+        if status_callback:
+            status_callback("Found embedded media URL...")
+        return direct_media_target(url, direct_candidates[0], title, "page scan")
+
+    for index, candidate in enumerate(candidates[:PAGE_SCAN_MAX_CANDIDATES], start=1):
+        if status_callback:
+            status_callback(f"Checking embedded player {index}/{min(len(candidates), PAGE_SCAN_MAX_CANDIDATES)}...")
+        headers = media_request_headers(url)
+        try:
+            info = extract_download_info_once(candidate, quick=True)
+            if has_media_for_mode(info, mode):
+                return target_from_info(candidate, info, http_headers=headers)
+        except Exception:
+            pass
+
+    if status_callback:
+        status_callback("Opening browser page scanner...")
+    browser_title, browser_candidates, browser_headers, browser_direct_candidates = discover_browser_media_urls(url, status_callback)
+    title = browser_title or title
+    if not browser_candidates:
+        if status_callback:
+            status_callback("No browser media stream found.")
+        return None
+
+    direct_candidate_limit = min(len(browser_direct_candidates), BROWSER_DIRECT_CANDIDATE_LIMIT)
+    for index, media_url in enumerate(browser_direct_candidates[:direct_candidate_limit], start=1):
+        if status_callback:
+            status_callback(f"Testing browser stream {index}/{direct_candidate_limit}...")
+        try:
+            headers = browser_headers.get(media_url) or media_request_headers(url)
+            verify_direct_media_access(media_url, headers)
+            info = extract_download_info_once(media_url, quick=True, http_headers=headers)
+            if not has_media_for_mode(info, mode):
+                continue
+            if status_callback:
+                status_callback("Found usable browser media stream...")
+            return direct_media_target(url, media_url, title, "browser scan", headers)
+        except Exception:
+            continue
+
+    remaining_candidates = [candidate for candidate in browser_candidates if candidate not in browser_direct_candidates]
+    for index, candidate in enumerate(remaining_candidates[:PAGE_SCAN_MAX_CANDIDATES], start=1):
+        if status_callback:
+            status_callback(
+                f"Checking browser media candidate {index}/{min(len(remaining_candidates), PAGE_SCAN_MAX_CANDIDATES)}..."
+            )
+        try:
+            info = extract_download_info_once(candidate, quick=True)
+            if has_media_for_mode(info, mode):
+                return target_from_info(candidate, info, http_headers=browser_headers.get(candidate) or media_request_headers(url))
+        except Exception:
+            pass
+
+    if status_callback:
+        status_callback("No downloadable browser media stream found.")
+    return None
+
+
+def discover_page_candidate_urls(url):
+    try:
+        page = fetch_page_html(url)
+    except Exception:
+        return None, []
+
+    title = page_title(page)
+    candidates = extract_candidate_urls_from_html(page, url)
+    return title, prioritize_candidate_urls(candidates)[:PAGE_SCAN_MAX_CANDIDATES]
+
+
+def discover_browser_media_urls(url, status_callback=None):
+    browser_exe = find_system_browser_exe()
+    if not browser_exe:
+        return None, [], {}, []
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None, [], {}, []
+
+    found_urls = []
+    request_headers = {}
+    direct_stream_priorities = {}
+    rendered_pages = []
+    page_title_text = None
+    browser = None
+
+    def remember(candidate, headers=None, stream_priority=0):
+        add_candidate_url(found_urls, url, candidate)
+        absolute = urljoin(url, clean_candidate_url(candidate) or "")
+        if absolute in found_urls and headers:
+            request_headers[absolute] = browser_media_headers(headers, url)
+        if absolute in found_urls and stream_priority:
+            direct_stream_priorities[absolute] = max(direct_stream_priorities.get(absolute, 0), stream_priority)
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(browser_exe),
+                headless=True,
+                args=[
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-popup-blocking",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--mute-audio",
+                    "--window-position=-32000,-32000",
+                    "--window-size=1,1",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=BROWSER_USER_AGENT,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                ignore_https_errors=True,
+            )
+            page = context.new_page()
+
+            def on_response(response):
+                response_url = response.url
+                content_type = response.headers.get("content-type", "")
+                if is_direct_media_url(response_url) or BROWSER_MEDIA_CONTENT_RE.search(content_type):
+                    try:
+                        response_headers = response.request.all_headers()
+                    except Exception:
+                        response_headers = response.request.headers
+                    try:
+                        cookies = context.cookies([response_url])
+                        if cookies and "cookie" not in {name.lower() for name in response_headers}:
+                            response_headers["cookie"] = "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
+                    except Exception:
+                        pass
+                    remember(response_url, response_headers, browser_stream_priority(response_url, content_type))
+
+            page.on("response", on_response)
+            page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_SCAN_TIMEOUT_MS)
+            if status_callback:
+                status_callback("Activating browser media players...")
+            activate_browser_media(page)
+            page.wait_for_timeout(750)
+            for frame in page.frames:
+                activate_browser_media(frame)
+            for offset in (0, 650, 1300, 1950):
+                try:
+                    page.evaluate(f"window.scrollTo(0, {offset});")
+                except Exception:
+                    pass
+                for frame in page.frames:
+                    activate_browser_media(frame)
+                page.wait_for_timeout(max(500, int(BROWSER_SCAN_SECONDS * 250)))
+            if status_callback:
+                status_callback("Watching browser media requests...")
+            page_title_text = page.title()
+            for frame in page.frames:
+                remember(frame.url)
+                try:
+                    rendered_pages.append(frame.content())
+                except Exception:
+                    pass
+            context.close()
+            browser.close()
+    except Exception:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        return None, [], {}, []
+
+    for rendered_html in rendered_pages:
+        for candidate in extract_candidate_urls_from_html(rendered_html, url):
+            remember(candidate)
+    for candidate in found_urls:
+        if is_direct_media_url(candidate):
+            direct_stream_priorities.setdefault(candidate, 2)
+    direct_candidates = sorted(direct_stream_priorities, key=lambda candidate: direct_stream_priorities[candidate], reverse=True)
+    candidates = prioritize_browser_candidates(found_urls, direct_candidates)
+    return page_title_text, candidates[:PAGE_SCAN_MAX_CANDIDATES], request_headers, direct_candidates
+
+
+def activate_browser_media(frame):
+    try:
+        frame.evaluate(
+            """
+            () => {
+                for (const video of document.querySelectorAll('video')) {
+                    video.muted = true;
+                    video.playsInline = true;
+                    video.scrollIntoView({block: 'center', inline: 'center'});
+                    const playPromise = video.play();
+                    if (playPromise && playPromise.catch) playPromise.catch(() => {});
+                }
+                const playControls = [...document.querySelectorAll('button, [role="button"]')]
+                    .filter(node => /play|watch|start/i.test(`${node.getAttribute('aria-label') || ''} ${node.title || ''} ${node.textContent || ''}`))
+                    .slice(0, 3);
+                for (const control of playControls) {
+                    try { control.click(); } catch (_) {}
+                }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def browser_media_headers(headers, page_url):
+    safe_headers = media_request_headers(page_url)
+    allowed_headers = {"accept", "accept-language", "cookie", "origin", "referer", "user-agent"}
+    for name, value in (headers or {}).items():
+        if name.lower() in allowed_headers and value:
+            safe_headers[name.title()] = value
+    return safe_headers
+
+
+def browser_stream_priority(url, content_type):
+    content_type = (content_type or "").lower()
+    path = urlparse(url).path.lower()
+    if BROWSER_STREAM_SEGMENT_RE.search(path):
+        return 0
+    if any(marker in content_type for marker in ("mpegurl", "dash+xml")) or path.endswith((".m3u8", ".mpd")):
+        return 3
+    if is_direct_media_url(url):
+        return 2
+    if "video/" in content_type or "audio/" in content_type:
+        return 1
+    return 0
+
+
+def prioritize_browser_candidates(candidates, direct_candidates):
+    direct_set = set(direct_candidates)
+    return direct_candidates + [candidate for candidate in candidates if candidate not in direct_set]
+
+
+def extract_candidate_urls_from_html(page, base_url):
+    prepared = html.unescape(page or "").replace("\\/", "/")
+    candidates = []
+    for pattern in (MEDIA_URL_RE, IFRAME_URL_RE, SOURCE_URL_RE, META_MEDIA_URL_RE):
+        for match in pattern.finditer(prepared):
+            candidate = match.groupdict().get("src") or match.group(0)
+            add_candidate_url(candidates, base_url, candidate)
+    return candidates
+
+
+def fetch_page_html(url):
+    request = Request(url, headers=media_request_headers(url))
+    with urlopen(request, timeout=30) as response:
+        content_type = response.headers.get("Content-Type", "")
+        if "text/" not in content_type and "html" not in content_type and "json" not in content_type:
+            return ""
+        raw = response.read(3_000_000)
+        encoding = response.headers.get_content_charset() or "utf-8"
+    return raw.decode(encoding, errors="replace")
+
+
+def add_candidate_url(candidates, base_url, candidate):
+    candidate = clean_candidate_url(candidate)
+    if not candidate:
+        return
+    absolute = urljoin(base_url, candidate)
+    if not absolute.startswith(("http://", "https://")):
+        return
+    if absolute not in candidates:
+        candidates.append(absolute)
+
+
+def prioritize_candidate_urls(candidates):
+    direct = [candidate for candidate in candidates if is_direct_media_url(candidate)]
+    other = [candidate for candidate in candidates if candidate not in direct]
+    return direct + other
+
+
+def clean_candidate_url(candidate):
+    candidate = html.unescape(unquote(candidate)).strip().strip("\"'()[]{}")
+    candidate = candidate.replace("\\u0026", "&").replace("\\/", "/")
+    if not candidate or candidate.startswith(("data:", "blob:", "javascript:")):
+        return None
+    return candidate
+
+
+def page_title(page):
+    match = re.search(r"<title[^>]*>(?P<title>.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", html.unescape(match.group("title"))).strip()
+
+
+def direct_media_target(page_url, media_url, title, source="page scan", http_headers=None):
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    parsed = urlparse(media_url)
+    media_id = Path(parsed.path).stem or "media"
+    return {
+        "directory": DOWNLOAD_DIR,
+        "is_collection": False,
+        "name": title or media_id,
+        "url": page_url,
+        "direct_media_url": media_url,
+        "id": media_id,
+        "http_headers": http_headers or media_request_headers(page_url),
+        "source": source,
+    }
+
+
+def is_direct_media_url(url):
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return suffix in {".mp4", ".webm", ".mov", ".mkv", ".m3u8", ".mpd"}
+
+
+def media_request_headers(referer=None):
+    headers = dict(COMMON_HTTP_HEADERS)
+    if referer:
+        parsed = urlparse(referer)
+        if parsed.scheme and parsed.netloc:
+            headers["Referer"] = referer
+            headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
+    return headers
+
+
+def available_browser_cookie_sources():
+    sources = []
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
+    app_data = Path(os.environ.get("APPDATA", ""))
+    if (local_app_data / "Google" / "Chrome" / "User Data").exists():
+        sources.append(("chrome",))
+    if (local_app_data / "Microsoft" / "Edge" / "User Data").exists():
+        sources.append(("edge",))
+    if (app_data / "Mozilla" / "Firefox" / "Profiles").exists():
+        sources.append(("firefox",))
+    return sources
+
+
+def find_system_browser_exe():
+    candidates = []
+    for env_name, relative in (
+        ("PROGRAMFILES", "Microsoft/Edge/Application/msedge.exe"),
+        ("PROGRAMFILES(X86)", "Microsoft/Edge/Application/msedge.exe"),
+        ("LOCALAPPDATA", "Microsoft/Edge/Application/msedge.exe"),
+        ("PROGRAMFILES", "Google/Chrome/Application/chrome.exe"),
+        ("PROGRAMFILES(X86)", "Google/Chrome/Application/chrome.exe"),
+        ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+    ):
+        base = os.environ.get(env_name)
+        if base:
+            candidates.append(Path(base) / Path(relative))
+    for command in ("msedge.exe", "chrome.exe"):
+        path = shutil.which(command)
+        if path:
+            candidates.append(Path(path))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def extract_twitter_fallback(url):
@@ -1096,7 +1670,7 @@ def no_media_message(url, mode):
 
 
 def mode_label(mode):
-    return {"gif": "video for GIF conversion", "audio": "audio", "video": "video"}.get(mode, "media")
+    return {"gif": "video for GIF conversion", "audio": "audio", "video": "video", "frames": "video"}.get(mode, "media")
 
 
 def is_x_or_twitter_url(url):
@@ -1144,8 +1718,119 @@ def direct_media_filename(target, suffix):
     return unique_path(Path(f"{title[:120]} [{media_id}]{suffix}")).name
 
 
-def download_direct_media(url, output_path, progress_hook):
+def format_download_size(size):
+    if not size:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024
+    return "0 B"
+
+
+def media_preview(input_text):
+    urls = extract_urls(input_text)
+    local_files = extract_local_files(input_text, urls)
+    if local_files:
+        return local_media_preview(local_files[0])
+    if urls:
+        return link_media_preview(urls[0])
+    return {"type": "preview", "message": "No media selected."}
+
+
+def local_media_preview(path):
+    path = Path(path)
+    if path.suffix.lower() not in LOCAL_FILE_SUFFIXES:
+        return {"type": "preview", "message": "Choose a supported media file to see a preview."}
+    if path.suffix.lower() in {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav"}:
+        return {"type": "preview", "title": path.name, "message": "Audio file selected."}
+
+    preview_dir = Path(tempfile.gettempdir()) / "MediaDownloader" / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_name = f"{abs(hash((str(path.resolve()), path.stat().st_mtime_ns))):x}.jpg"
+    preview_path = preview_dir / preview_name
+    if not preview_path.exists():
+        run_ffmpeg(
+            [
+                str(find_ffmpeg_exe()),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "0.5",
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=min(320\\,iw):-2",
+                "-q:v",
+                "4",
+                "-y",
+                str(preview_path),
+            ]
+        )
+    image = base64.b64encode(preview_path.read_bytes()).decode("ascii")
+    return {
+        "type": "preview",
+        "title": path.name,
+        "message": f"Local file | {format_download_size(path.stat().st_size)}",
+        "src": f"data:image/jpeg;base64,{image}",
+    }
+
+
+def link_media_preview(url):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "http_headers": media_request_headers(url),
+        "socket_timeout": 12,
+        "retries": 1,
+        "extractor_retries": 1,
+    }
+    with get_yt_dlp().YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info.get("entries"):
+        info = next((entry for entry in info["entries"] if entry), info)
+    thumbnail = info.get("thumbnail")
+    title = info.get("title") or "Media preview"
+    details = []
+    duration = info.get("duration")
+    if duration:
+        details.append(format_duration(duration))
+    if info.get("width") and info.get("height"):
+        details.append(f"{info['width']}x{info['height']}")
+    filesize = info.get("filesize") or info.get("filesize_approx")
+    if filesize:
+        details.append(format_download_size(filesize))
+    source = info.get("uploader") or info.get("channel") or info.get("extractor_key") or info.get("extractor")
+    if source:
+        details.append(str(source))
+    message = " | ".join(details) or "Media link"
+    if thumbnail:
+        return {"type": "preview", "title": title, "message": message, "src": thumbnail}
+    return {"type": "preview", "title": title, "message": "No preview image is available for this link."}
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{seconds:02}"
+    return f"{minutes}:{seconds:02}"
+
+
+def download_direct_media(url, output_path, progress_hook, http_headers=None):
     output_path = unique_path(output_path)
+    headers = http_headers or media_request_headers(url)
+    progress_hook({"status": "checking"})
+    verify_direct_media_access(url, headers)
+    progress_hook({"status": "preparing"})
     options = make_ydl_options(
         progress_hook,
         output_path,
@@ -1153,15 +1838,70 @@ def download_direct_media(url, output_path, progress_hook):
         format_selector="best",
         merge_output_format=None,
     )
-    options["http_headers"] = {
-        "Referer": "https://twitter.com/",
-        "User-Agent": "Mozilla/5.0",
-    }
+    options["http_headers"] = headers
+    options["socket_timeout"] = DIRECT_MEDIA_DOWNLOAD_TIMEOUT_SECONDS
+    options["retries"] = 0
+    options["fragment_retries"] = 0
     with get_yt_dlp().YoutubeDL(options) as ydl:
         code = ydl.download([url])
     if code:
         raise RuntimeError("Direct media download failed.")
     return output_path
+
+
+def verify_direct_media_access(url, headers):
+    deadline = time.monotonic() + DIRECT_MEDIA_PROBE_TIMEOUT_SECONDS
+    is_hls = urlparse(url).path.lower().endswith(".m3u8")
+    request_headers = dict(headers)
+    if not is_hls:
+        request_headers["Range"] = "bytes=0-1"
+    request = Request(url, headers=request_headers)
+    try:
+        with urlopen(request, timeout=remaining_media_probe_timeout(deadline)) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"Media server returned HTTP {response.status}.")
+            content_type = response.headers.get("Content-Type", "")
+            payload = response.read(HLS_PLAYLIST_PROBE_BYTES if is_hls or "mpegurl" in content_type.lower() else 1)
+        if is_hls or "mpegurl" in content_type.lower():
+            verify_hls_media_segment(url, payload, headers, deadline=deadline)
+    except URLError as exc:
+        reason = getattr(exc, "reason", None) or str(exc)
+        raise RuntimeError(f"Could not connect to the captured media stream: {reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("The captured media stream did not respond within 15 seconds.") from exc
+
+
+def remaining_media_probe_timeout(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return min(DIRECT_MEDIA_CONNECT_TIMEOUT_SECONDS, max(1, remaining))
+
+
+def verify_hls_media_segment(playlist_url, playlist_payload, headers, depth=0, deadline=None):
+    deadline = deadline or time.monotonic() + DIRECT_MEDIA_PROBE_TIMEOUT_SECONDS
+    lines = [line.strip() for line in playlist_payload.decode("utf-8", errors="replace").splitlines()]
+    media_lines = [line for line in lines if line and not line.startswith("#")]
+    if not media_lines:
+        raise RuntimeError("The captured HLS playlist does not contain media segments.")
+
+    next_url = urljoin(playlist_url, media_lines[0])
+    is_master_playlist = any(line.startswith("#EXT-X-STREAM-INF") for line in lines)
+    if is_master_playlist and depth < 2:
+        request = Request(next_url, headers=dict(headers))
+        with urlopen(request, timeout=remaining_media_probe_timeout(deadline)) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"Media server returned HTTP {response.status}.")
+            payload = response.read(HLS_PLAYLIST_PROBE_BYTES)
+        return verify_hls_media_segment(next_url, payload, headers, depth + 1, deadline)
+
+    request_headers = dict(headers)
+    request_headers["Range"] = "bytes=0-1"
+    request = Request(next_url, headers=request_headers)
+    with urlopen(request, timeout=remaining_media_probe_timeout(deadline)) as response:
+        if response.status >= 400:
+            raise RuntimeError(f"Media server returned HTTP {response.status}.")
+        response.read(1)
 
 
 def remux_new_videos(directory, started_at):
@@ -1329,6 +2069,39 @@ def convert_source_to_gif(source, output_dir, delete_source=True):
     return gif_path
 
 
+def extract_unique_frames(source, output_dir):
+    source = Path(source)
+    output_dir = Path(output_dir)
+    folder_name = safe_folder_name(source.stem.replace(".source", ""))
+    frame_dir = unique_path(output_dir / folder_name)
+    frame_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        run_ffmpeg(
+            [
+                find_ffmpeg_exe(),
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-vf",
+                "mpdecimate",
+                "-vsync",
+                "vfr",
+                str(frame_dir / "frame-%06d.png"),
+            ]
+        )
+        if not any(frame_dir.glob("frame-*.png")):
+            raise RuntimeError("No video frames could be extracted.")
+        return frame_dir
+    except Exception:
+        try:
+            shutil.rmtree(frame_dir)
+        except OSError:
+            pass
+        raise
+
+
 def convert_gif_to_video(source, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
     video_path = unique_path(output_dir / f"{source.stem}.mp4")
@@ -1443,6 +2216,195 @@ def run_ffmpeg(args, return_output=False):
     return None
 
 
+class DownloadBridge:
+    """Line-delimited JSON bridge used by the Photino desktop shell."""
+
+    def __init__(self):
+        self.cancel_event = threading.Event()
+        self.worker = None
+        self.output_lock = threading.Lock()
+        self.download_total = 0
+        self.download_current = 0
+        self.download_completed = 0
+
+    def emit(self, event):
+        with self.output_lock:
+            print(json.dumps(event, ensure_ascii=True), flush=True)
+
+    def run(self):
+        self.emit({"type": "ready"})
+        for line in sys.stdin:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            action = message.get("action")
+            if action == "start":
+                self.start(message.get("input", ""), message.get("mode", "video"))
+            elif action == "preview":
+                request_id = message.get("requestId")
+                threading.Thread(
+                    target=self._preview_worker,
+                    args=(message.get("input", ""), request_id),
+                    daemon=True,
+                ).start()
+            elif action == "cancel":
+                self.cancel_event.set()
+                self.emit({"type": "state", "phase": "downloading", "status": "Cancelling download..."})
+            elif action == "shutdown":
+                self.cancel_event.set()
+                return
+
+    def _preview_worker(self, input_text, request_id):
+        try:
+            preview = media_preview(input_text)
+        except Exception as exc:
+            preview = {"type": "preview", "message": f"Preview unavailable: {str(exc).splitlines()[0]}"}
+        preview["requestId"] = request_id
+        self.emit(preview)
+
+    def start(self, input_text, mode):
+        if self.worker and self.worker.is_alive():
+            self.emit({"type": "error", "message": "A download is already running."})
+            return
+
+        urls = extract_urls(input_text)
+        local_files = extract_local_files(input_text, urls)
+        validation_error = validate_inputs(urls, local_files)
+        if validation_error:
+            self.emit({"type": "error", "message": validation_error})
+            return
+
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        self.cancel_event.clear()
+        self.download_total = len(urls) + len(local_files)
+        self.download_current = 0
+        self.download_completed = 0
+        item_count = self.download_total
+        item_text = "item" if item_count == 1 else "items"
+        self.emit(
+            {
+                "type": "state",
+                "phase": "scanning",
+                "status": f"Scanning {item_count} {item_text} for media...",
+                "progress": 0,
+                "indeterminate": False,
+            }
+        )
+        self.worker = threading.Thread(target=self._download_worker, args=(urls, local_files, mode), daemon=True)
+        self.worker.start()
+
+    def _download_worker(self, urls, local_files, mode):
+        try:
+            outputs = []
+            if local_files:
+                outputs.append(process_local_files(local_files, mode, self._status, self.cancel_event))
+            if mode == "video":
+                output = download_best_video(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+            elif mode == "gif":
+                output = download_best_gifs(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+            elif mode == "frames":
+                output = download_best_frames(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+            else:
+                output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+            if output:
+                outputs.append(output)
+            self.emit({"type": "state", "phase": "done", "status": f"Saved: {'; '.join(outputs)}", "progress": 100})
+        except get_download_cancelled():
+            self.emit({"type": "state", "phase": "cancelled", "status": "Download cancelled."})
+        except Exception as exc:
+            self.emit({"type": "error", "message": str(exc)})
+
+    def _status(self, text):
+        scanning_prefixes = (
+            "Scanning page",
+            "Opening browser",
+            "Activating browser",
+            "Watching browser",
+            "Testing browser",
+            "Checking browser",
+            "Checking embedded",
+            "Found embedded",
+            "Found usable browser",
+        )
+        if "Converting" in text or "Extracting" in text:
+            phase = "converting"
+        elif text.startswith(scanning_prefixes):
+            phase = "scanning"
+        else:
+            phase = "downloading"
+        self.emit({"type": "state", "phase": phase, "status": text})
+
+    def _progress_hook(self, data):
+        if self.cancel_event.is_set():
+            raise get_download_cancelled()("Download cancelled.")
+
+        self._sync_download_position(data)
+        status = data.get("status")
+        count = self._download_count_prefix()
+        if status == "checking":
+            self.emit({"type": "state", "phase": "downloading", "status": "Checking media connection...", "indeterminate": True})
+            return
+        if status == "preparing":
+            self.emit({"type": "state", "phase": "downloading", "status": "Connecting to media stream...", "indeterminate": True})
+            return
+        if status == "downloading":
+            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+            downloaded = data.get("downloaded_bytes") or 0
+            speed = data.get("_speed_str", "").strip()
+            fragment_index = data.get("fragment_index")
+            fragment_count = data.get("fragment_count")
+            if total:
+                item_percent = downloaded / total * 100
+                message = f"{count}Downloading... {item_percent:.1f}% {speed}".strip()
+                self.emit({"type": "state", "phase": "downloading", "status": message, "progress": self._overall_progress(item_percent), "indeterminate": False})
+            elif isinstance(fragment_index, int) and isinstance(fragment_count, int) and fragment_count > 0:
+                item_percent = fragment_index / fragment_count * 100
+                message = f"{count}Downloading stream... {fragment_index}/{fragment_count} parts {speed}".strip()
+                self.emit({"type": "state", "phase": "downloading", "status": message, "progress": self._overall_progress(item_percent), "indeterminate": False})
+            else:
+                message = f"{count}Downloading stream... {format_download_size(downloaded)} received {speed}".strip()
+                self.emit({"type": "state", "phase": "downloading", "status": message, "indeterminate": True})
+        elif status == "finished":
+            self.download_completed = max(self.download_completed, self.download_current)
+            self.emit(
+                {
+                    "type": "state",
+                    "phase": "downloading",
+                    "status": f"{count}Processing downloaded media...",
+                    "progress": self._overall_progress(100),
+                    "indeterminate": False,
+                }
+            )
+
+    def _sync_download_position(self, data):
+        info = data.get("info_dict") or {}
+        playlist_total = info.get("playlist_count") or info.get("n_entries") or data.get("playlist_count") or data.get("n_entries")
+        playlist_index = info.get("playlist_index") or data.get("playlist_index")
+        if isinstance(playlist_total, int) and playlist_total > self.download_total:
+            self.download_total = playlist_total
+        if isinstance(playlist_index, int) and playlist_index > 0:
+            self.download_current = playlist_index
+        elif self.download_total:
+            self.download_current = min(self.download_completed + 1, self.download_total)
+
+    def _download_count_prefix(self):
+        if self.download_total <= 1:
+            return ""
+        current = self.download_current or min(self.download_completed + 1, self.download_total)
+        return f"{current}/{self.download_total} "
+
+    def _overall_progress(self, item_percent):
+        if self.download_total <= 1:
+            return item_percent
+        current = self.download_current or min(self.download_completed + 1, self.download_total)
+        return min(100, ((current - 1) + item_percent / 100) / self.download_total * 100)
+
+
 if __name__ == "__main__":
-    app = DownloadApp()
-    app.mainloop()
+    if "--bridge" in sys.argv:
+        DownloadBridge().run()
+    else:
+        app = DownloadApp()
+        app.mainloop()

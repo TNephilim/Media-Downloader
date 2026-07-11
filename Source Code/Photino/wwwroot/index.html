@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Downloader</title>
+  <style>
+    :root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0d1724; color: #edf3fb; min-width: 0; overflow: hidden; }
+    main { height: 100vh; padding: 14px; display: flex; flex-direction: column; gap: 7px; }
+    header { height: 24px; display: flex; align-items: baseline; justify-content: space-between; flex: none; }
+    h1 { margin: 0; font-size: 20px; line-height: 1.1; font-weight: 700; letter-spacing: 0; }
+    .version { color: #94b9ef; font-size: 12px; }
+    .input-area { height: 58px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; flex: none; }
+    textarea { width: 100%; height: 58px; resize: none; border: 1px solid #45546a; border-radius: 6px; outline: none; background: #111c2a; color: #f7fafc; padding: 8px 12px; font: 13px/18px "Segoe UI", Arial, sans-serif; }
+    textarea:focus { border-color: #4b93f7; box-shadow: 0 0 0 1px #4b93f7; }
+    .side-actions { display: grid; grid-template-columns: 66px 72px 108px; gap: 7px; }
+    button { border: 1px solid #46566d; border-radius: 6px; background: #1d2a3c; color: #f3f7fc; font: 13px "Segoe UI", Arial, sans-serif; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
+    button:hover:not(:disabled) { background: #2a3b53; border-color: #6b87ad; }
+    button:disabled { opacity: .48; cursor: default; }
+    .preview { height: 48px; display: flex; align-items: center; gap: 9px; border: 1px solid #34455d; border-radius: 6px; background: #101b29; padding: 4px 8px; flex: none; overflow: hidden; }
+    .preview-image { width: 62px; height: 36px; border-radius: 3px; object-fit: cover; background: #070d16; display: none; }
+    .preview.ready .preview-image { display: block; }
+    .preview-copy { min-width: 0; display: grid; gap: 3px; }
+    .preview-label { color: #85a8da; font-size: 11px; text-transform: uppercase; letter-spacing: 0; }
+    .preview-title { color: #edf3fb; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .preview-message { color: #a8b7cc; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .preview.empty { display: none; }
+    .modes { height: 42px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; flex: none; }
+    .modes button { border-color: #3c80e2; background: #1e64c9; box-shadow: inset 0 1px 0 #4b93f7; font-size: 13px; font-weight: 650; }
+    .modes button:hover:not(:disabled) { border-color: #67a8ff; background: #2b76dc; }
+    .progress-track { height: 8px; border: 1px solid #354760; border-radius: 5px; background: #101a28; overflow: hidden; flex: none; }
+    .progress-fill { height: 100%; width: 0%; background: #2fc86f; transition: width 160ms linear; }
+    .progress-fill.running { width: 38%; animation: pulse 1.05s ease-in-out infinite alternate; }
+    @keyframes pulse { from { transform: translateX(-30%); } to { transform: translateX(170%); } }
+    .state-block { height: 55px; flex: none; }
+    .state { height: 34px; display: grid; place-items: center; border: 1px solid #276f50; border-radius: 6px; background: #123329; color: #59e68c; font-weight: 700; font-size: 13px; }
+    .state.done { border-color: #286ea8; background: #102f4d; color: #9dd7ff; }
+    .state.scanning { border-color: #7559b6; background: #291b48; color: #d7b8ff; }
+    .state.error { border-color: #8f2e37; background: #461015; color: #fec3c8; }
+    .state.cancelled { border-color: #5f6064; background: #2c2b2d; color: #ded8d0; }
+    .status { height: 21px; padding: 3px 2px 1px; color: #b5c2d5; font: 12px/16px "Segoe UI", Arial, sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    footer { height: 32px; display: flex; justify-content: space-between; align-items: center; margin-top: auto; padding-top: 0; flex: none; }
+    footer button { height: 32px; padding: 0 11px; }
+    #cancel { color: #ff9ba2; border-color: #80505a; }
+    .drop-active textarea { border-color: #4c93ff; background: #1c2c40; }
+  </style>
+</head>
+<body>
+  <main id="app">
+    <header><h1>Media Downloader</h1><span class="version">v1.1.3</span></header>
+    <section class="input-area" id="drop-zone">
+      <textarea id="input" aria-label="Media links or file paths" spellcheck="false" placeholder="Paste links, drop media files, or choose files"></textarea>
+      <div class="side-actions">
+        <button id="clear" title="Clear text box">Clear</button>
+        <button id="paste" title="Paste from clipboard">Paste</button>
+        <button id="choose" title="Choose media files">Choose File</button>
+      </div>
+    </section>
+    <section class="preview empty" id="preview" aria-label="Media preview">
+      <img class="preview-image" id="preview-image" alt="Media preview">
+      <div class="preview-copy"><span class="preview-label">Preview</span><span class="preview-title" id="preview-title">No media selected</span><span class="preview-message" id="preview-message">Paste a link or choose a media file.</span></div>
+    </section>
+    <section class="modes">
+      <button data-mode="video">Download Video</button>
+      <button data-mode="mp3">Download Audio</button>
+      <button data-mode="gif">Download GIF</button>
+      <button data-mode="frames">Extract Frames</button>
+    </section>
+    <div class="progress-track" aria-label="Download progress"><div class="progress-fill" id="progress"></div></div>
+    <div class="state-block"><div class="state" id="phase">READY</div><div class="status" id="status">No downloads currently</div></div>
+    <footer><button id="folder">Open Downloads Folder</button><button id="cancel" disabled>Cancel Download</button></footer>
+  </main>
+  <script>
+    const input = document.querySelector('#input');
+    const phase = document.querySelector('#phase');
+    const status = document.querySelector('#status');
+    const progress = document.querySelector('#progress');
+    const cancel = document.querySelector('#cancel');
+    const preview = document.querySelector('#preview');
+    const previewImage = document.querySelector('#preview-image');
+    const previewTitle = document.querySelector('#preview-title');
+    const previewMessage = document.querySelector('#preview-message');
+    const modeButtons = [...document.querySelectorAll('[data-mode]')];
+    const app = document.querySelector('#app');
+    const send = payload => window.external.sendMessage(JSON.stringify(payload));
+    let previewTimer;
+    let previewRequestId = 0;
+    let previewVisible = false;
+
+    const setPreviewVisibility = visible => {
+      if (previewVisible === visible) return;
+      previewVisible = visible;
+      send({ action: 'previewVisibility', visible });
+    };
+
+    const setEmptyPreview = message => {
+      preview.className = 'preview empty'; previewImage.removeAttribute('src');
+      previewTitle.textContent = 'No media selected'; previewMessage.textContent = message || 'Paste a link or choose a media file.';
+      setPreviewVisibility(false);
+    };
+    const requestPreview = () => {
+      const value = input.value.trim();
+      if (!value) { setEmptyPreview(); return; }
+      const requestId = ++previewRequestId;
+      preview.className = 'preview empty'; previewTitle.textContent = 'Loading preview...'; previewMessage.textContent = 'Checking the first media item.';
+      setPreviewVisibility(false);
+      send({ action: 'preview', input: value, requestId });
+    };
+    const schedulePreview = () => { clearTimeout(previewTimer); previewTimer = setTimeout(requestPreview, 650); };
+    const setFiles = files => { if (files?.length) { input.value = files.join('\n'); requestPreview(); } };
+
+    document.querySelector('#clear').onclick = () => { input.value = ''; ++previewRequestId; setEmptyPreview(); };
+    document.querySelector('#paste').onclick = async () => { try { input.value = await navigator.clipboard.readText(); requestPreview(); } catch { } };
+    document.querySelector('#choose').onclick = () => send({ action: 'choose' });
+    document.querySelector('#folder').onclick = () => send({ action: 'openDownloads' });
+    cancel.onclick = () => send({ action: 'cancel' });
+    input.addEventListener('change', schedulePreview);
+    modeButtons.forEach(button => button.onclick = () => send({ action: 'start', mode: button.dataset.mode, input: input.value }));
+
+    const dropZone = document.querySelector('#drop-zone');
+    ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); app.classList.add('drop-active'); }));
+    ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); app.classList.remove('drop-active'); }));
+    dropZone.addEventListener('drop', event => {
+      const paths = [...event.dataTransfer.files].map(file => file.path).filter(Boolean);
+      if (paths.length) send({ action: 'files', files: paths });
+    });
+
+    window.external.receiveMessage(message => {
+      const event = JSON.parse(message);
+      if (event.type === 'files') { setFiles(event.files); return; }
+      if (event.type === 'preview') {
+        if (event.requestId !== previewRequestId) return;
+        previewTitle.textContent = event.title || 'Preview unavailable'; previewMessage.textContent = event.message || 'No preview image is available.';
+        if (event.src) { preview.className = 'preview ready'; previewImage.src = event.src; setPreviewVisibility(true); }
+        else { preview.className = 'preview empty'; previewImage.removeAttribute('src'); setPreviewVisibility(false); }
+        return;
+      }
+      if (event.type === 'ready') return;
+      if (event.type === 'error') {
+        phase.textContent = 'DOWNLOAD FAILED'; phase.className = 'state error'; status.textContent = event.message;
+        progress.className = 'progress-fill'; progress.style.width = '0%'; cancel.disabled = true; modeButtons.forEach(button => button.disabled = false); return;
+      }
+      if (event.type !== 'state') return;
+      const currentPhase = event.phase || 'downloading';
+      phase.textContent = ({ scanning: 'SCANNING', downloading: 'DOWNLOADING', converting: 'CONVERTING', done: 'DOWNLOAD COMPLETE', cancelled: 'DOWNLOAD CANCELLED' })[currentPhase] || 'DOWNLOADING';
+      phase.className = `state ${currentPhase === 'done' ? 'done' : currentPhase === 'cancelled' ? 'cancelled' : currentPhase === 'scanning' ? 'scanning' : ''}`;
+      status.textContent = event.status || 'No downloads currently';
+      if (event.indeterminate) { progress.className = 'progress-fill running'; progress.style.width = ''; }
+      else { progress.className = 'progress-fill'; progress.style.width = `${Math.max(0, Math.min(100, event.progress ?? 0))}%`; }
+      const busy = currentPhase === 'scanning' || currentPhase === 'downloading' || currentPhase === 'converting';
+      cancel.disabled = !busy; modeButtons.forEach(button => button.disabled = busy);
+    });
+  </script>
+</body>
+</html>
