@@ -16,9 +16,6 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
-        backend = new BackendBridge(SendToPage);
-        backend.Start();
-
         window = new PhotinoWindow()
             .SetTitle("Media Downloader")
             .SetUseOsDefaultSize(false)
@@ -30,9 +27,9 @@ internal static class Program
             .SetContextMenuEnabled(false);
 
         window.WebMessageReceived += (_, message) => HandlePageMessage(message);
-        window.Load(ExtractUserInterface());
+        window.StartString = ReadUserInterface();
         window.WaitForClose();
-        backend.Dispose();
+        backend?.Dispose();
     }
 
     private static void HandlePageMessage(string message)
@@ -46,6 +43,7 @@ internal static class Program
             switch (action)
             {
                 case "start":
+                    EnsureBackend();
                     backend?.Send(new
                     {
                         action,
@@ -54,6 +52,7 @@ internal static class Program
                     });
                     break;
                 case "cancel":
+                    EnsureBackend();
                     backend?.Send(new { action });
                     break;
                 case "choose":
@@ -74,6 +73,17 @@ internal static class Program
         {
             SendToPage(new { type = "error", message = exception.Message });
         }
+    }
+
+    private static void EnsureBackend()
+    {
+        if (backend is not null)
+        {
+            return;
+        }
+
+        backend = new BackendBridge(SendToPage);
+        backend.Start();
     }
 
     private static void ChooseFiles()
@@ -103,23 +113,13 @@ internal static class Program
         window?.SendWebMessage(JsonSerializer.Serialize(message, JsonOptions));
     }
 
-    private static string ExtractUserInterface()
+    private static string ReadUserInterface()
     {
         const string resourceName = "MediaDownloaderUi.index.html";
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
             ?? throw new InvalidOperationException("The bundled interface could not be loaded.");
-        using var memory = new MemoryStream();
-        stream.CopyTo(memory);
-        var bytes = memory.ToArray();
-        var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).Substring(0, 12).ToLowerInvariant();
-        var directory = Path.Combine(Path.GetTempPath(), "MediaDownloader", "ui", hash);
-        var path = Path.Combine(directory, "index.html");
-        Directory.CreateDirectory(directory);
-        if (!File.Exists(path) || new FileInfo(path).Length != bytes.Length)
-        {
-            File.WriteAllBytes(path, bytes);
-        }
-        return path;
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        return reader.ReadToEnd();
     }
 }
 
@@ -179,6 +179,10 @@ internal sealed class BackendBridge : IDisposable
         try
         {
             using var document = JsonDocument.Parse(line);
+            if (document.RootElement.TryGetProperty("type", out var type) && type.GetString() == "ready")
+            {
+                return;
+            }
             sendToPage(document.RootElement.Clone());
         }
         catch (JsonException)
