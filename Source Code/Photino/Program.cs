@@ -18,6 +18,7 @@ internal static class Program
     {
         window = new PhotinoWindow()
             .SetTitle("Media Downloader")
+            .SetTemporaryFilesPath(GetPhotinoDataPath())
             .SetUseOsDefaultSize(false)
             .SetSize(WindowWidth, WindowHeight)
             .SetMinSize(WindowWidth, WindowHeight)
@@ -27,9 +28,16 @@ internal static class Program
             .SetContextMenuEnabled(false);
 
         window.WebMessageReceived += (_, message) => HandlePageMessage(message);
-        window.StartString = ReadUserInterface();
+        window.StartUrl = ExtractUserInterface();
         window.WaitForClose();
         backend?.Dispose();
+    }
+
+    private static string GetPhotinoDataPath()
+    {
+        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MediaDownloader", "Photino");
+        Directory.CreateDirectory(path);
+        return path;
     }
 
     private static void HandlePageMessage(string message)
@@ -113,13 +121,23 @@ internal static class Program
         window?.SendWebMessage(JsonSerializer.Serialize(message, JsonOptions));
     }
 
-    private static string ReadUserInterface()
+    private static string ExtractUserInterface()
     {
         const string resourceName = "MediaDownloaderUi.index.html";
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
             ?? throw new InvalidOperationException("The bundled interface could not be loaded.");
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-        return reader.ReadToEnd();
+        using var memory = new MemoryStream();
+        stream.CopyTo(memory);
+        var bytes = memory.ToArray();
+        var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).Substring(0, 12).ToLowerInvariant();
+        var directory = Path.Combine(Path.GetTempPath(), "MediaDownloader", "ui", hash);
+        var path = Path.Combine(directory, "index.html");
+        Directory.CreateDirectory(directory);
+        if (!File.Exists(path) || new FileInfo(path).Length != bytes.Length)
+        {
+            File.WriteAllBytes(path, bytes);
+        }
+        return path;
     }
 }
 
