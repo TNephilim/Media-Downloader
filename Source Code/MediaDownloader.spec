@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+hiddenimports = collect_submodules('yt_dlp') + [
+    'imageio_ffmpeg',
+]
+datas = collect_data_files('imageio_ffmpeg')
 
 a = Analysis(
     ['src\\media_downloader.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=['playwright.sync_api'],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -8,8 +8,7 @@ using System.Windows.Forms;
 internal static class Program
 {
     private const int WindowWidth = 700;
-    private const int CompactWindowHeight = 335;
-    private const int PreviewWindowHeight = 395;
+    private const int WindowHeight = 355;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private static PhotinoWindow? window;
     private static BackendBridge? backend;
@@ -18,13 +17,14 @@ internal static class Program
     private static void Main()
     {
         backend = new BackendBridge(SendToPage);
+        backend.Start();
 
         window = new PhotinoWindow()
             .SetTitle("Media Downloader")
             .SetUseOsDefaultSize(false)
-            .SetSize(WindowWidth, CompactWindowHeight)
-            .SetMinSize(WindowWidth, CompactWindowHeight)
-            .SetMaxSize(WindowWidth, CompactWindowHeight)
+            .SetSize(WindowWidth, WindowHeight)
+            .SetMinSize(WindowWidth, WindowHeight)
+            .SetMaxSize(WindowWidth, WindowHeight)
             .SetResizable(false)
             .SetDevToolsEnabled(false)
             .SetContextMenuEnabled(false);
@@ -46,7 +46,6 @@ internal static class Program
             switch (action)
             {
                 case "start":
-                    EnsureBackendStarted();
                     backend?.Send(new
                     {
                         action,
@@ -56,18 +55,6 @@ internal static class Program
                     break;
                 case "cancel":
                     backend?.Send(new { action });
-                    break;
-                case "preview":
-                    EnsureBackendStarted();
-                    backend?.Send(new
-                    {
-                        action,
-                        input = root.GetProperty("input").GetString(),
-                        requestId = root.GetProperty("requestId").GetInt32(),
-                    });
-                    break;
-                case "previewVisibility":
-                    ResizeForPreview(root.GetProperty("visible").GetBoolean());
                     break;
                 case "choose":
                     ChooseFiles();
@@ -111,17 +98,6 @@ internal static class Program
         Process.Start(new ProcessStartInfo { FileName = downloads, UseShellExecute = true });
     }
 
-    private static void EnsureBackendStarted()
-    {
-        backend?.Start();
-    }
-
-    private static void ResizeForPreview(bool visible)
-    {
-        var height = visible ? PreviewWindowHeight : CompactWindowHeight;
-        window?.SetMinSize(WindowWidth, height).SetMaxSize(WindowWidth, height).SetSize(WindowWidth, height);
-    }
-
     private static void SendToPage(object message)
     {
         window?.SendWebMessage(JsonSerializer.Serialize(message, JsonOptions));
@@ -151,7 +127,6 @@ internal sealed class BackendBridge : IDisposable
 {
     private readonly Action<object> sendToPage;
     private readonly object inputLock = new();
-    private readonly object startLock = new();
     private Process? process;
     private StreamWriter? input;
 
@@ -162,35 +137,28 @@ internal sealed class BackendBridge : IDisposable
 
     public void Start()
     {
-        lock (startLock)
+        var backendPath = ExtractBackend();
+        process = new Process
         {
-            if (process is { HasExited: false })
+            StartInfo = new ProcessStartInfo
             {
-                return;
-            }
-            var backendPath = ExtractBackend();
-            process = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = backendPath,
-                    Arguments = "--bridge",
-                    UseShellExecute = false,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                },
-                EnableRaisingEvents = true,
-            };
-            process.OutputDataReceived += (_, args) => ForwardBackendMessage(args.Data);
-            process.ErrorDataReceived += (_, _) => { };
-            process.Start();
-            input = process.StandardInput;
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-        }
+                FileName = backendPath,
+                Arguments = "--bridge",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+            },
+            EnableRaisingEvents = true,
+        };
+        process.OutputDataReceived += (_, args) => ForwardBackendMessage(args.Data);
+        process.ErrorDataReceived += (_, _) => { };
+        process.Start();
+        input = process.StandardInput;
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
     }
 
     public void Send(object message)
