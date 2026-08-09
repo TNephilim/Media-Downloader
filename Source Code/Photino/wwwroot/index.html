@@ -5,79 +5,244 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Media Downloader</title>
   <style>
-    :root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; }
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", Arial, sans-serif;
+      --accent: #2563d0;
+      --accent-hover: #1d4ed8;
+      --accent-border: #3b82f6;
+      --accent-focus: #4c93ff;
+      --accent-muted: #1e3a6f;
+      --accent-muted-border: #284878;
+      --accent-muted-text: #9fb5d8;
+      --accent-soft: #8dbdff;
+      --accent-soft-bg: #1c2c40;
+      --accent-scroll: #365b91;
+    }
     * { box-sizing: border-box; }
     html, body { width: 100%; height: 100%; }
-    body { margin: 0; padding: 10px; background: #070c14; color: #e7edf7; overflow: hidden; }
-    main { height: 335px; padding: 12px 16px 14px; display: grid; grid-template-rows: auto 44px 42px 10px 48px 1fr 34px; gap: 8px; background: #101826; border: 1px solid #243244; }
+    body { margin: 0; padding: 8px; background: color-mix(in srgb, var(--accent) 18%, #070c14); color: #e7edf7; overflow: hidden; }
+    main { height: 100%; padding: 10px 14px; display: grid; grid-template-rows: 22px 40px 30px 24px 38px 8px 46px 32px; gap: 5px; background: color-mix(in srgb, var(--accent) 8%, #101826); border: 1px solid color-mix(in srgb, var(--accent-border) 58%, #243244); box-shadow: inset 0 3px 0 var(--accent); }
     header { display: flex; align-items: baseline; justify-content: space-between; }
-    h1 { margin: 0; font-size: 22px; line-height: 1.1; font-weight: 700; letter-spacing: 0; }
-    .version { color: #8290a8; font-size: 12px; }
-    .input-area { display: grid; grid-template-columns: 1fr 68px 70px 108px; gap: 8px; min-height: 44px; }
-    textarea { width: 100%; height: 44px; resize: none; border: 1px solid #3a475b; outline: none; background: #182332; color: #f7fafc; padding: 5px 12px; font: 13px/16px "Segoe UI", Arial, sans-serif; overflow: hidden; }
-    textarea:focus { border-color: #4c93ff; }
+    h1 { margin: 0; color: var(--accent-soft); font-size: 21px; line-height: 1.1; font-weight: 700; letter-spacing: 0; }
+    .version { color: color-mix(in srgb, var(--accent-soft) 72%, #8290a8); font-size: 12px; }
+    .input-area { display: grid; grid-template-columns: 1fr 68px 70px 108px; gap: 8px; min-height: 40px; }
+    textarea { width: 100%; height: 40px; resize: none; border: 1px solid color-mix(in srgb, var(--accent-border) 32%, #3a475b); outline: none; background: color-mix(in srgb, var(--accent) 7%, #182332); color: #f7fafc; padding: 4px 12px; font: 13px/16px "Segoe UI", Arial, sans-serif; overflow: hidden; }
+    textarea:focus { border-color: var(--accent-focus); }
     .side-actions { display: contents; }
-    .side-actions button { height: 44px; }
-    button { border: 1px solid #415068; border-radius: 4px; background: #202d3e; color: #edf3fb; font: 13px "Segoe UI", Arial, sans-serif; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
-    button:hover:not(:disabled) { background: #2b3b51; border-color: #6381a9; }
+    .side-actions button { height: 40px; }
+    .name-area { display: grid; grid-template-columns: 88px minmax(0, 1fr); height: 30px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--accent-border) 32%, #3a475b); background: color-mix(in srgb, var(--accent) 7%, #182332); }
+    .name-area:focus-within { border-color: var(--accent-focus); }
+    .name-area label { display: grid; place-items: center; border-right: 1px solid color-mix(in srgb, var(--accent-border) 32%, #3a475b); background: color-mix(in srgb, var(--accent) 15%, #202d3e); color: var(--accent-soft); font-size: 13px; }
+    .name-area input { width: 100%; height: 28px; min-width: 0; border: 0; outline: none; background: transparent; color: #f7fafc; padding: 0 10px; font: 13px "Segoe UI", Arial, sans-serif; }
+    .quality-area { display: grid; grid-template-columns: 88px minmax(0, 1fr); height: 24px; position: relative; border: 1px solid color-mix(in srgb, var(--accent-border) 28%, #3a475b); background: color-mix(in srgb, var(--accent) 5%, #141e2b); }
+    .quality-area label { display: grid; place-items: center; border-right: 1px solid color-mix(in srgb, var(--accent-border) 28%, #3a475b); background: color-mix(in srgb, var(--accent) 15%, #202d3e); color: var(--accent-soft); font-size: 12px; }
+    .details-control { min-width: 0; position: relative; }
+    #quality { width: 100%; height: 22px; min-width: 0; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 0; background: transparent; color: #b8c9df; padding: 2px 8px; font: 12px/16px "Segoe UI", Arial, sans-serif; text-align: left; }
+    #quality:not(:disabled):hover { background: #1a293a; border-color: transparent; }
+    #quality:disabled { color: #b8c9df; opacity: 1; }
+    #quality-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .details-arrow { width: 7px; height: 7px; margin-left: auto; margin-right: 3px; border-right: 1px solid #b8c9df; border-bottom: 1px solid #b8c9df; transform: rotate(45deg) translateY(-2px); }
+    .details-menu { position: absolute; z-index: 3; right: 0; top: calc(100% + 5px); width: 100%; max-height: 316px; overflow-y: auto; padding: 4px; border: 1px solid var(--accent-border); background: color-mix(in srgb, var(--accent) 10%, #182332); box-shadow: 0 4px 12px #070c14; scrollbar-color: var(--accent-focus) #101826; scrollbar-width: thin; }
+    .details-menu[hidden] { display: none; }
+    .details-menu::-webkit-scrollbar { width: 10px; }
+    .details-menu::-webkit-scrollbar-track { background: #101826; }
+    .details-menu::-webkit-scrollbar-thumb { background: var(--accent-scroll); border: 2px solid #101826; border-radius: 6px; }
+    .details-menu::-webkit-scrollbar-thumb:hover { background: var(--accent-focus); }
+    .details-menu button { width: 100%; min-height: 28px; overflow: hidden; border: 0; border-radius: 2px; background: #172536; color: #c3d3e9; padding: 5px 7px; font: 12px/16px "Segoe UI", Arial, sans-serif; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+    .details-menu button:nth-child(odd):not(.details-summary) { background: #1d2d41; }
+    .details-menu button:hover { background: #263b54; color: #ffffff; }
+    .details-menu .details-summary { color: var(--accent-soft); border-bottom: 1px solid #3a475b; margin-bottom: 3px; }
+    button { border: 1px solid color-mix(in srgb, var(--accent-border) 36%, #415068); border-radius: 4px; background: color-mix(in srgb, var(--accent) 11%, #202d3e); color: #edf3fb; font: 13px "Segoe UI", Arial, sans-serif; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
+    button:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 21%, #2b3b51); border-color: var(--accent-focus); }
     button:disabled { opacity: .48; cursor: default; }
-    .modes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-    .modes button { height: 42px; border-color: #3b82f6; background: #2563d0; color: #ffffff; font-size: 14px; font-weight: 700; }
-    .modes button:hover:not(:disabled) { background: #1d4ed8; border-color: #60a5fa; }
-    .modes button:disabled { background: #1e3a6f; border-color: #284878; color: #9fb5d8; }
-    .progress-track { height: 10px; background: #1b2736; border: 1px solid #344258; overflow: hidden; }
-    .progress-fill { height: 100%; width: 0%; background: #22c55e; transition: width 160ms linear; }
+    .modes { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+    .modes button { height: 38px; border-color: var(--accent-border); background: var(--accent); color: #ffffff; font-size: 13px; font-weight: 700; }
+    .modes button:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-focus); }
+    .modes button:disabled { background: var(--accent-muted); border-color: var(--accent-muted-border); color: var(--accent-muted-text); }
+    .frames-control { position: relative; }
+    .frames-control > #frames-button { width: 100%; height: 38px; }
+    .frame-menu { position: absolute; z-index: 2; right: 0; bottom: calc(100% + 5px); width: 150px; display: grid; gap: 4px; padding: 5px; border: 1px solid var(--accent-border); background: color-mix(in srgb, var(--accent) 10%, #182332); box-shadow: 0 4px 12px #070c14; }
+    .frame-menu[hidden] { display: none; }
+    .frame-menu button { height: 30px; background: #202d3e; border-color: #415068; color: #edf3fb; font-size: 12px; font-weight: 600; }
+    .progress-track { height: 8px; background: color-mix(in srgb, var(--accent) 12%, #1b2736); border: 1px solid color-mix(in srgb, var(--accent-border) 40%, #344258); overflow: hidden; }
+    .progress-fill { height: 100%; width: 0%; background: var(--accent-focus); transition: width 160ms linear; }
     .progress-fill.running { width: 38%; animation: pulse 1.05s ease-in-out infinite alternate; }
     @keyframes pulse { from { transform: translateX(-30%); } to { transform: translateX(170%); } }
-    .state { height: 30px; display: grid; place-items: center; border: 1px solid #16834b; background: #052e1b; color: #4ade80; font-weight: 700; font-size: 14px; }
+    .state { height: 28px; display: grid; place-items: center; border: 1px solid #16834b; background: #052e1b; color: #4ade80; font-weight: 700; font-size: 13px; }
     .state.done { background: #112d49; color: #a9d8ff; }
     .state.error { background: #440d12; color: #fec5c9; }
     .state.cancelled { background: #2c2a2b; color: #ded8d0; }
-    .status { height: 18px; margin-top: 5px; color: #aab7ca; font-size: 13px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .status { height: 32px; margin-top: 4px; color: #aab7ca; font-size: 12px; line-height: 15px; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
     footer { display: flex; justify-content: space-between; align-items: center; }
-    footer button { height: 34px; padding: 0 12px; }
+    footer button { height: 32px; padding: 0 12px; }
     #cancel { color: #ffb4b9; }
-    .drop-active textarea { border-color: #4c93ff; background: #1c2c40; }
+    .drop-active textarea { border-color: var(--accent-focus); background: var(--accent-soft-bg); }
   </style>
 </head>
 <body>
   <main id="app">
-    <header><h1>Media Downloader</h1><span class="version">v1.1.6</span></header>
+    <header><h1>Media Downloader</h1><span class="version">v1.1.7</span></header>
     <section class="input-area" id="drop-zone">
-      <textarea id="input" aria-label="Media links or file paths" spellcheck="false" placeholder="Paste links, drop media files, or choose files"></textarea>
+      <textarea id="input" aria-label="Media link or file path" spellcheck="false" placeholder="Paste link or drop a file"></textarea>
       <div class="side-actions">
         <button id="clear" title="Clear text box">Clear</button>
         <button id="paste" title="Paste from clipboard">Paste</button>
         <button id="choose" title="Choose media files">Choose File</button>
       </div>
     </section>
+    <section class="name-area">
+      <label for="output-name">Save as</label>
+      <input id="output-name" aria-label="Output filename" spellcheck="false" placeholder="File name">
+    </section>
+    <section class="quality-area">
+      <label for="quality">Details</label>
+      <div class="details-control">
+        <button id="quality" aria-label="Media details" disabled><span id="quality-text">No video detected</span><span id="details-arrow" class="details-arrow" hidden></span></button>
+        <div id="details-menu" class="details-menu" hidden></div>
+      </div>
+    </section>
     <section class="modes">
       <button data-mode="video">Download Video</button>
-      <button data-mode="mp3">Download Audio</button>
       <button data-mode="gif">Download GIF</button>
-      <button data-mode="frames">Extract Frames</button>
+      <button data-mode="mp3">Download Audio</button>
+      <button data-mode="fix-video" title="Repair a selected or dropped video file">Fix Video</button>
+      <div class="frames-control">
+        <button id="frames-button" data-mode="frames" aria-haspopup="menu" aria-expanded="false">Extract Frames</button>
+        <div id="frame-menu" class="frame-menu" role="menu" hidden>
+          <button data-frame-mode="frame-first" role="menuitem">First Frame</button>
+          <button data-frame-mode="frames" role="menuitem">All Frames</button>
+          <button data-frame-mode="frames-similar" role="menuitem">Unique Frames</button>
+        </div>
+      </div>
     </section>
     <div class="progress-track" aria-label="Download progress"><div class="progress-fill" id="progress"></div></div>
     <div><div class="state" id="phase">READY</div><div class="status" id="status">No downloads currently</div></div>
     <footer><button id="folder">Open Downloads Folder</button><button id="cancel" disabled>Cancel Download</button></footer>
   </main>
   <script>
+    const themes = [
+      { accent: '#2563d0', hover: '#1d4ed8', border: '#3b82f6', focus: '#4c93ff', muted: '#1e3a6f', mutedBorder: '#284878', mutedText: '#9fb5d8', soft: '#8dbdff', softBg: '#1c2c40', scroll: '#365b91' },
+      { accent: '#7c3aed', hover: '#6d28d9', border: '#a78bfa', focus: '#c4b5fd', muted: '#3b236b', mutedBorder: '#51338b', mutedText: '#c4b5fd', soft: '#c4b5fd', softBg: '#2b1e46', scroll: '#6d4ca8' },
+      { accent: '#0f766e', hover: '#0d5f58', border: '#2dd4bf', focus: '#5eead4', muted: '#164b49', mutedBorder: '#216b67', mutedText: '#93e4da', soft: '#5eead4', softBg: '#163837', scroll: '#287c76' },
+      { accent: '#15803d', hover: '#166534', border: '#4ade80', focus: '#86efac', muted: '#1d5933', mutedBorder: '#2b7846', mutedText: '#a7e8b8', soft: '#86efac', softBg: '#1a3b27', scroll: '#2e8a50' },
+      { accent: '#b91c1c', hover: '#991b1b', border: '#f87171', focus: '#fca5a5', muted: '#672425', mutedBorder: '#873438', mutedText: '#f5b3b6', soft: '#fca5a5', softBg: '#451d22', scroll: '#914047' },
+      { accent: '#c2410c', hover: '#9a3412', border: '#fb923c', focus: '#fdba74', muted: '#6b361b', mutedBorder: '#8a4925', mutedText: '#f7c18f', soft: '#fdba74', softBg: '#482a1c', scroll: '#98512a' },
+      { accent: '#be185d', hover: '#9d174d', border: '#f472b6', focus: '#f9a8d4', muted: '#6b254c', mutedBorder: '#8c3565', mutedText: '#f2b1d3', soft: '#f9a8d4', softBg: '#49203a', scroll: '#963e70' },
+      { accent: '#a16207', hover: '#854d0e', border: '#facc15', focus: '#fde047', muted: '#654a17', mutedBorder: '#86631f', mutedText: '#f4df91', soft: '#fde047', softBg: '#423819', scroll: '#927320' },
+    ];
+    const selectedTheme = themes[Math.floor(Math.random() * themes.length)];
+    const themeRoot = document.documentElement.style;
+    themeRoot.setProperty('--accent', selectedTheme.accent);
+    themeRoot.setProperty('--accent-hover', selectedTheme.hover);
+    themeRoot.setProperty('--accent-border', selectedTheme.border);
+    themeRoot.setProperty('--accent-focus', selectedTheme.focus);
+    themeRoot.setProperty('--accent-muted', selectedTheme.muted);
+    themeRoot.setProperty('--accent-muted-border', selectedTheme.mutedBorder);
+    themeRoot.setProperty('--accent-muted-text', selectedTheme.mutedText);
+    themeRoot.setProperty('--accent-soft', selectedTheme.soft);
+    themeRoot.setProperty('--accent-soft-bg', selectedTheme.softBg);
+    themeRoot.setProperty('--accent-scroll', selectedTheme.scroll);
+
     const input = document.querySelector('#input');
+    const outputName = document.querySelector('#output-name');
+    const quality = document.querySelector('#quality');
+    const qualityText = document.querySelector('#quality-text');
+    const detailsArrow = document.querySelector('#details-arrow');
+    const detailsMenu = document.querySelector('#details-menu');
     const phase = document.querySelector('#phase');
     const status = document.querySelector('#status');
     const progress = document.querySelector('#progress');
     const cancel = document.querySelector('#cancel');
     const modeButtons = [...document.querySelectorAll('[data-mode]')];
+    const framesButton = document.querySelector('#frames-button');
+    const frameMenu = document.querySelector('#frame-menu');
+    const frameOptionButtons = [...document.querySelectorAll('[data-frame-mode]')];
     const app = document.querySelector('#app');
     const send = payload => window.external.sendMessage(JSON.stringify(payload));
-    const setFiles = files => { if (files?.length) input.value = files.join('\n'); };
+    const sanitizeOutputName = () => { outputName.value = outputName.value.replace(/[<>:"/\\|?*\x00-\x1f]/g, ''); };
+    const setDetailsMenuOpen = open => {
+      detailsMenu.hidden = !open;
+      send({ action: 'detailsMenu', open });
+    };
+    const setDetails = (summary, entries = []) => {
+      qualityText.textContent = summary;
+      quality.disabled = entries.length === 0;
+      detailsArrow.hidden = entries.length === 0;
+      setDetailsMenuOpen(false);
+      detailsMenu.replaceChildren();
+      if (!entries.length) return;
+      const addEntry = (text, className = '') => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = text;
+        button.title = text;
+        button.className = className;
+        button.onclick = () => { qualityText.textContent = text; setDetailsMenuOpen(false); };
+        detailsMenu.append(button);
+      };
+      addEntry(summary, 'details-summary');
+      entries.forEach(text => addEntry(text));
+    };
+    let previewTimer;
+    let previewRequestId = 0;
+    let isBusy = false;
+    const scheduleNamePreview = () => {
+      clearTimeout(previewTimer);
+      const requestId = ++previewRequestId;
+      outputName.value = '';
+      outputName.placeholder = input.value.trim() ? 'Loading name...' : 'File name';
+      setDetails(input.value.trim() ? 'Checking for video...' : 'No video detected');
+      if (!input.value.trim()) return;
+      previewTimer = setTimeout(() => send({ action: 'inspect', requestId, input: input.value }), 500);
+    };
+    const setFiles = files => { if (files?.length) { input.value = files.join('\n'); scheduleNamePreview(); } };
 
-    document.querySelector('#clear').onclick = () => input.value = '';
-    document.querySelector('#paste').onclick = async () => { try { input.value = await navigator.clipboard.readText(); } catch { } };
+    document.querySelector('#clear').onclick = () => { input.value = ''; scheduleNamePreview(); };
+    document.querySelector('#paste').onclick = async () => { try { input.value = await navigator.clipboard.readText(); scheduleNamePreview(); } catch { } };
     document.querySelector('#choose').onclick = () => send({ action: 'choose' });
     document.querySelector('#folder').onclick = () => send({ action: 'openDownloads' });
-    cancel.onclick = () => send({ action: 'cancel' });
-    modeButtons.forEach(button => button.onclick = () => send({ action: 'start', mode: button.dataset.mode, input: input.value }));
+    cancel.onclick = () => {
+      if (cancel.disabled) return;
+      cancel.disabled = true;
+      phase.textContent = 'CANCELLING'; phase.className = 'state cancelled';
+      status.textContent = 'Stopping conversion...';
+      send({ action: 'cancel' });
+    };
+    input.addEventListener('input', scheduleNamePreview);
+    outputName.addEventListener('input', sanitizeOutputName);
+    const startDownload = mode => {
+      // Begin polling immediately. The first backend state can arrive before its normal UI update.
+      isBusy = true;
+      sanitizeOutputName();
+      cancel.disabled = false;
+      frameMenu.hidden = true;
+      modeButtons.concat(frameOptionButtons).forEach(modeButton => modeButton.disabled = true);
+      send({ action: 'start', mode, input: input.value, outputName: outputName.value });
+    };
+    modeButtons.filter(button => button !== framesButton).forEach(button => button.onclick = () => startDownload(button.dataset.mode));
+    framesButton.onclick = event => {
+      event.stopPropagation();
+      if (framesButton.disabled) return;
+      const opening = frameMenu.hidden;
+      frameMenu.hidden = !opening;
+      framesButton.setAttribute('aria-expanded', String(opening));
+    };
+    frameOptionButtons.forEach(button => button.onclick = () => {
+      frameMenu.hidden = true;
+      framesButton.setAttribute('aria-expanded', 'false');
+      startDownload(button.dataset.frameMode);
+    });
+    quality.onclick = event => {
+      event.stopPropagation();
+      if (!quality.disabled) setDetailsMenuOpen(detailsMenu.hidden);
+    };
+    detailsMenu.onclick = event => event.stopPropagation();
+    document.addEventListener('click', () => { frameMenu.hidden = true; framesButton.setAttribute('aria-expanded', 'false'); setDetailsMenuOpen(false); });
+
+    setInterval(() => {
+      if (isBusy) send({ action: 'poll' });
+    }, 150);
 
     const dropZone = document.querySelector('#drop-zone');
     ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); app.classList.add('drop-active'); }));
@@ -90,20 +255,32 @@
     window.external.receiveMessage(message => {
       const event = JSON.parse(message);
       if (event.type === 'files') { setFiles(event.files); return; }
+      if (event.type === 'previewProgress') {
+        if (event.requestId !== previewRequestId) return;
+        setDetails(event.status || 'Detecting videos...', []);
+        return;
+      }
+      if (event.type === 'preview') {
+        if (event.requestId !== previewRequestId) return;
+        outputName.value = event.name || '';
+        outputName.placeholder = 'File name';
+        setDetails(event.quality || 'No video detected', event.entries || []);
+        return;
+      }
       if (event.type === 'ready') return;
       if (event.type === 'error') {
         phase.textContent = 'DOWNLOAD FAILED'; phase.className = 'state error'; status.textContent = event.message;
-        progress.className = 'progress-fill'; progress.style.width = '0%'; cancel.disabled = true; modeButtons.forEach(button => button.disabled = false); return;
+        progress.className = 'progress-fill'; progress.style.width = '0%'; isBusy = false; cancel.disabled = true; modeButtons.concat(frameOptionButtons).forEach(button => button.disabled = false); return;
       }
       if (event.type !== 'state') return;
       const currentPhase = event.phase || 'downloading';
-      phase.textContent = ({ downloading: 'DOWNLOADING', converting: 'CONVERTING', extracting: 'EXTRACTING FRAMES', done: 'DOWNLOAD COMPLETE', cancelled: 'DOWNLOAD CANCELLED' })[currentPhase] || 'DOWNLOADING';
+      phase.textContent = ({ downloading: 'DOWNLOADING', converting: 'CONVERTING', extracting: 'EXTRACTING FRAMES', cancelling: 'CANCELLING', done: 'DOWNLOAD COMPLETE', cancelled: 'DOWNLOAD CANCELLED' })[currentPhase] || 'DOWNLOADING';
       phase.className = `state ${currentPhase === 'done' ? 'done' : currentPhase === 'cancelled' ? 'cancelled' : ''}`;
       status.textContent = event.status || 'No downloads currently';
       if (event.indeterminate) { progress.className = 'progress-fill running'; progress.style.width = ''; }
       else { progress.className = 'progress-fill'; progress.style.width = `${Math.max(0, Math.min(100, event.progress ?? 0))}%`; }
-      const busy = currentPhase === 'downloading' || currentPhase === 'converting';
-      cancel.disabled = !busy; modeButtons.forEach(button => button.disabled = busy);
+      isBusy = currentPhase === 'downloading' || currentPhase === 'converting' || currentPhase === 'extracting' || currentPhase === 'cancelling';
+      cancel.disabled = !isBusy || currentPhase === 'cancelling'; modeButtons.concat(frameOptionButtons).forEach(button => button.disabled = isBusy);
     });
   </script>
 </body>

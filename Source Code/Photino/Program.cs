@@ -8,7 +8,8 @@ using System.Windows.Forms;
 internal static class Program
 {
     private const int WindowWidth = 700;
-    private const int WindowHeight = 355;
+    private const int WindowHeight = 357;
+    private const int DetailsWindowHeight = 512;
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private static PhotinoWindow? window;
     private static BackendBridge? backend;
@@ -22,11 +23,12 @@ internal static class Program
             .SetUseOsDefaultSize(false)
             .SetSize(WindowWidth, WindowHeight)
             .SetMinSize(WindowWidth, WindowHeight)
-            .SetMaxSize(WindowWidth, WindowHeight)
+            .SetMaxSize(WindowWidth, DetailsWindowHeight)
             .SetResizable(false)
             .SetDevToolsEnabled(false)
             .SetContextMenuEnabled(false);
 
+        window.Centered = true;
         window.WebMessageReceived += (_, message) => HandlePageMessage(message);
         window.StartUrl = ExtractUserInterface();
         window.WaitForClose();
@@ -57,11 +59,28 @@ internal static class Program
                         action,
                         mode = root.GetProperty("mode").GetString(),
                         input = root.GetProperty("input").GetString(),
+                        outputName = root.TryGetProperty("outputName", out var outputName) ? outputName.GetString() : string.Empty,
+                    });
+                    break;
+                case "inspect":
+                    EnsureBackend();
+                    backend?.Send(new
+                    {
+                        action,
+                        requestId = root.GetProperty("requestId").GetInt32(),
+                        input = root.GetProperty("input").GetString(),
                     });
                     break;
                 case "cancel":
                     EnsureBackend();
                     backend?.Send(new { action });
+                    break;
+                case "poll":
+                    backend?.FlushLatestState();
+                    break;
+                case "detailsMenu":
+                    var detailsOpen = root.TryGetProperty("open", out var open) && open.GetBoolean();
+                    window?.SetSize(WindowWidth, detailsOpen ? DetailsWindowHeight : WindowHeight);
                     break;
                 case "choose":
                     ChooseFiles();
@@ -118,7 +137,8 @@ internal static class Program
 
     private static void SendToPage(object message)
     {
-        window?.SendWebMessage(JsonSerializer.Serialize(message, JsonOptions));
+        var payload = JsonSerializer.Serialize(message, JsonOptions);
+        window?.Invoke(() => window.SendWebMessage(payload));
     }
 
     private static string ExtractUserInterface()
@@ -145,8 +165,11 @@ internal sealed class BackendBridge : IDisposable
 {
     private readonly Action<object> sendToPage;
     private readonly object inputLock = new();
+    private readonly object stateLock = new();
+    private readonly string statePath = Path.Combine(Path.GetTempPath(), "MediaDownloader", $"state-{Guid.NewGuid():N}.json");
     private Process? process;
     private StreamWriter? input;
+    private string? latestStateMessage;
 
     public BackendBridge(Action<object> sendToPage)
     {
@@ -171,6 +194,8 @@ internal sealed class BackendBridge : IDisposable
             },
             EnableRaisingEvents = true,
         };
+        Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+        process.StartInfo.Environment["MEDIA_DOWNLOADER_STATE_PATH"] = statePath;
         process.OutputDataReceived += (_, args) => ForwardBackendMessage(args.Data);
         process.ErrorDataReceived += (_, _) => { };
         process.Start();
@@ -201,11 +226,52 @@ internal sealed class BackendBridge : IDisposable
             {
                 return;
             }
+            if (document.RootElement.TryGetProperty("type", out type) && type.GetString() == "state")
+            {
+                lock (stateLock)
+                {
+                    latestStateMessage = line;
+                }
+                return;
+            }
             sendToPage(document.RootElement.Clone());
         }
         catch (JsonException)
         {
             // The bundled engine's normal output is intentionally ignored; only JSON bridge events reach the page.
+        }
+    }
+
+    public void FlushLatestState()
+    {
+        string? message;
+        try
+        {
+            message = File.Exists(statePath) ? File.ReadAllText(statePath, Encoding.UTF8) : null;
+        }
+        catch (IOException)
+        {
+            message = null;
+        }
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            lock (stateLock)
+            {
+                message = latestStateMessage;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(message);
+            sendToPage(document.RootElement.Clone());
+        }
+        catch (JsonException)
+        {
+            // Ignore an incomplete state message and wait for the next backend update.
         }
     }
 
@@ -238,10 +304,11 @@ internal sealed class BackendBridge : IDisposable
         try { Send(new { action = "shutdown" }); } catch { }
         if (process is { HasExited: false })
         {
-            process.WaitForExit(1000);
+            process.WaitForExit(5000);
             if (!process.HasExited)
             {
                 process.Kill(true);
+                process.WaitForExit(2000);
             }
         }
         process?.Dispose();

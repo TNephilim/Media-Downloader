@@ -3,22 +3,18 @@ import os
 import queue
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
-import time
-import tkinter as tk
 import tempfile
+import time
 from pathlib import Path
-from tkinter import filedialog, ttk
-from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.1.6"
-GITHUB_REPO = "TNephilim/media-downloader"
-RELEASE_ASSET_NAME = "MediaDownloader.exe"
+APP_VERSION = "1.1.7"
 TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
@@ -39,572 +35,6 @@ MEDIA_SOURCE_SUFFIXES = {
     ".webm",
 }
 VIDEO_SOURCE_SUFFIXES = {".mp4", ".webm", ".mkv", ".mov"}
-FRAME_SOURCE_SUFFIXES = VIDEO_SOURCE_SUFFIXES | {".gif"}
-LOCAL_FILE_SUFFIXES = MEDIA_SOURCE_SUFFIXES | {".gif"}
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    APP_TK_CLASS = TkinterDnD.Tk
-except Exception:
-    DND_FILES = None
-    APP_TK_CLASS = tk.Tk
-
-
-class DownloadApp(APP_TK_CLASS):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_NAME)
-        self.geometry("700x320")
-        self.minsize(700, 320)
-        self.resizable(False, False)
-        self.configure(bg="#111827")
-
-        self.events = queue.Queue()
-        self.worker = None
-        self.cancel_event = threading.Event()
-        self.download_total = 0
-        self.download_current = 0
-        self.download_completed = 0
-
-        self.phase_var = tk.StringVar(value="READY")
-        self.status_var = tk.StringVar(value="No downloads currently")
-        self.progress_var = tk.DoubleVar(value=0)
-
-        self._configure_styles()
-        self._build_ui()
-        self.after(1000, self._check_for_updates)
-        self.after(100, self._process_events)
-
-    def _configure_styles(self):
-        self.style = ttk.Style(self)
-        try:
-            self.style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        self.style.configure(".", background="#111827", foreground="#e5e7eb", font=("Segoe UI", 10))
-        self.style.configure("TFrame", background="#111827")
-        self.style.configure("TLabel", background="#111827", foreground="#e5e7eb")
-        self.style.configure("Muted.TLabel", background="#111827", foreground="#9ca3af")
-        self.style.configure(
-            "TButton",
-            background="#1f2937",
-            foreground="#f9fafb",
-            bordercolor="#374151",
-            focusthickness=1,
-            focuscolor="#3b82f6",
-            padding=(10, 6),
-        )
-        self.style.configure(
-            "Primary.TButton",
-            background="#2563eb",
-            foreground="#ffffff",
-            bordercolor="#3b82f6",
-            focusthickness=1,
-            focuscolor="#60a5fa",
-            padding=(10, 7),
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.style.map(
-            "TButton",
-            background=[("active", "#374151"), ("disabled", "#111827")],
-            foreground=[("disabled", "#6b7280")],
-        )
-        self.style.map(
-            "Primary.TButton",
-            background=[("active", "#1d4ed8"), ("disabled", "#1e3a8a")],
-            foreground=[("disabled", "#93a4bf")],
-        )
-        self.style.configure(
-            "Download.Horizontal.TProgressbar",
-            troughcolor="#1f2937",
-            background="#16a34a",
-            lightcolor="#16a34a",
-            darkcolor="#16a34a",
-            bordercolor="#374151",
-        )
-        self.style.configure(
-            "Convert.Horizontal.TProgressbar",
-            troughcolor="#1f2937",
-            background="#16a34a",
-            lightcolor="#16a34a",
-            darkcolor="#16a34a",
-            bordercolor="#374151",
-        )
-        self.style.configure(
-            "Done.Horizontal.TProgressbar",
-            troughcolor="#1f2937",
-            background="#0f7ae5",
-            lightcolor="#0f7ae5",
-            darkcolor="#0f7ae5",
-            bordercolor="#374151",
-        )
-        self.style.configure(
-            "Error.Horizontal.TProgressbar",
-            troughcolor="#1f2937",
-            background="#dc2626",
-            lightcolor="#dc2626",
-            darkcolor="#dc2626",
-            bordercolor="#374151",
-        )
-
-    def _build_ui(self):
-        root = ttk.Frame(self, padding=(18, 14, 18, 16))
-        root.pack(fill=tk.BOTH, expand=True)
-        root.columnconfigure(0, weight=1)
-
-        title_row = ttk.Frame(root)
-        title_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        title_row.columnconfigure(0, weight=1)
-
-        title = ttk.Label(title_row, text=APP_NAME, font=("Segoe UI", 17, "bold"))
-        title.grid(row=0, column=0, sticky="w")
-
-        version = ttk.Label(title_row, text=f"v{APP_VERSION}", style="Muted.TLabel")
-        version.grid(row=0, column=1, sticky="e")
-
-        entry_row = ttk.Frame(root)
-        entry_row.grid(row=1, column=0, sticky="ew")
-        entry_row.columnconfigure(0, weight=1)
-        entry_row.rowconfigure((0, 1, 2), weight=1)
-
-        self.url_text = tk.Text(
-            entry_row,
-            height=2,
-            font=("Segoe UI", 10),
-            bg="#1f2937",
-            fg="#f9fafb",
-            insertbackground="#f9fafb",
-            relief=tk.FLAT,
-            bd=0,
-            padx=10,
-            pady=7,
-            wrap="word",
-            highlightthickness=1,
-            highlightbackground="#374151",
-            highlightcolor="#3b82f6",
-        )
-        self.url_text.grid(row=0, column=0, rowspan=3, sticky="nsew")
-
-        self.clear_button = ttk.Button(entry_row, text="Clear", command=self._clear_text_box)
-        self.clear_button.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 3))
-
-        paste_button = ttk.Button(entry_row, text="Paste", command=self._paste_clipboard)
-        paste_button.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
-
-        self.choose_button = ttk.Button(entry_row, text="Choose File", command=self._choose_files)
-        self.choose_button.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(3, 0))
-
-        button_row = ttk.Frame(root)
-        button_row.grid(row=2, column=0, sticky="ew", pady=(8, 6))
-        button_row.columnconfigure((0, 1, 2, 3), weight=1)
-
-        self.video_button = ttk.Button(
-            button_row,
-            text="Download Video",
-            style="Primary.TButton",
-            command=lambda: self._start_download("video"),
-        )
-        self.video_button.grid(row=0, column=0, sticky="ew", padx=(0, 4), ipady=6)
-
-        self.mp3_button = ttk.Button(
-            button_row,
-            text="Download Audio",
-            style="Primary.TButton",
-            command=lambda: self._start_download("mp3"),
-        )
-        self.mp3_button.grid(row=0, column=1, sticky="ew", padx=4, ipady=6)
-
-        self.gif_button = ttk.Button(
-            button_row,
-            text="Download GIF",
-            style="Primary.TButton",
-            command=lambda: self._start_download("gif"),
-        )
-        self.gif_button.grid(row=0, column=2, sticky="ew", padx=4, ipady=6)
-
-        self.frames_button = ttk.Button(
-            button_row,
-            text="Extract Frames",
-            style="Primary.TButton",
-            command=lambda: self._start_download("frames"),
-        )
-        self.frames_button.grid(row=0, column=3, sticky="ew", padx=(4, 0), ipady=6)
-
-        self.progress = ttk.Progressbar(
-            root,
-            variable=self.progress_var,
-            maximum=100,
-            mode="determinate",
-            style="Download.Horizontal.TProgressbar",
-        )
-        self.progress.grid(row=3, column=0, sticky="ew", pady=(2, 6))
-
-        self.phase_label = tk.Label(
-            root,
-            textvariable=self.phase_var,
-            anchor="center",
-            font=("Segoe UI", 11, "bold"),
-            bg="#172033",
-            fg="#93c5fd",
-            padx=10,
-            pady=7,
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#374151",
-        )
-        self.phase_label.grid(row=4, column=0, sticky="ew")
-
-        self.status_label = ttk.Label(root, textvariable=self.status_var, style="Muted.TLabel")
-        self.status_label.grid(row=5, column=0, sticky="ew", pady=(6, 0))
-
-        bottom_row = ttk.Frame(root)
-        bottom_row.grid(row=6, column=0, sticky="ew", pady=(12, 0))
-        bottom_row.columnconfigure(0, weight=1)
-
-        open_button = ttk.Button(bottom_row, text="Open Downloads Folder", command=self._open_download_folder)
-        open_button.grid(row=0, column=0, sticky="w")
-
-        self.cancel_button = ttk.Button(bottom_row, text="Cancel Download", command=self._cancel_download)
-        self.cancel_button.grid(row=0, column=1, sticky="e")
-        self.cancel_button.configure(state=tk.DISABLED)
-
-        if DND_FILES:
-            self._register_drop_targets(root, entry_row, self.url_text, button_row, bottom_row)
-
-    def _try_load_clipboard(self):
-        try:
-            text = self.clipboard_get().strip()
-        except tk.TclError:
-            return
-        if "http://" in text or "https://" in text or Path(text).is_file():
-            self.url_text.delete("1.0", tk.END)
-            self.url_text.insert("1.0", text)
-
-    def _paste_clipboard(self):
-        self._try_load_clipboard()
-
-    def _clear_text_box(self):
-        self.url_text.delete("1.0", tk.END)
-
-    def _choose_files(self):
-        files = filedialog.askopenfilenames(
-            title="Choose media files",
-            filetypes=[
-                ("Media files", "*.mp4 *.webm *.mkv *.mov *.gif *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.wav"),
-                ("All files", "*.*"),
-            ],
-        )
-        if files:
-            self._replace_input_items(files)
-
-    def _drop_files(self, event):
-        files = self.tk.splitlist(event.data)
-        if files:
-            self._replace_input_items(files)
-
-    def _replace_input_items(self, items):
-        self.url_text.delete("1.0", tk.END)
-        self.url_text.insert("1.0", "\n".join(str(item) for item in items))
-
-    def _register_drop_targets(self, *widgets):
-        for widget in widgets:
-            widget.drop_target_register(DND_FILES)
-            widget.dnd_bind("<<Drop>>", self._drop_files)
-
-    def _cancel_download(self):
-        if self.worker and self.worker.is_alive():
-            self.cancel_event.set()
-            self.cancel_button.configure(state=tk.DISABLED)
-            self._set_status("Cancelling download...")
-
-    def _start_download(self, mode):
-        if self.worker and self.worker.is_alive():
-            self._show_dialog("Download Running", "A download is already running.")
-            return
-
-        input_text = self._get_input_text()
-        if not input_text:
-            self._try_load_clipboard()
-            input_text = self._get_input_text()
-
-        urls = extract_urls(input_text)
-        local_files = extract_local_files(input_text, urls)
-        validation_error = validate_inputs(urls, local_files)
-        if validation_error:
-            self._show_dialog("Cannot Download", validation_error, "error")
-            return
-
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        self.progress_var.set(0)
-        self.cancel_event.clear()
-        self.download_total = len(urls) + len(local_files)
-        self.download_current = 0
-        self.download_completed = 0
-        self._set_phase("downloading")
-        self._set_busy(True)
-        item_count = len(urls) + len(local_files)
-        item_text = "item" if item_count == 1 else "items"
-        self._set_status(f"Starting {item_count} {item_text}...")
-
-        self.worker = threading.Thread(target=self._download_worker, args=(urls, local_files, mode), daemon=True)
-        self.worker.start()
-
-    def _get_input_text(self):
-        return self.url_text.get("1.0", tk.END).strip()
-
-    def _download_worker(self, urls, local_files, mode):
-        try:
-            outputs = []
-            if local_files:
-                outputs.append(process_local_files(local_files, mode, self._status, self.cancel_event))
-            if mode == "video":
-                output = download_best_video(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
-            elif mode == "gif":
-                output = download_best_gifs(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
-            elif mode == "frames":
-                output = download_best_frames(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
-            else:
-                output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
-            if output:
-                outputs.append(output)
-            self.events.put(("done", f"Saved: {'; '.join(outputs)}"))
-        except get_download_cancelled():
-            self.events.put(("cancelled", "Download cancelled."))
-        except Exception as exc:
-            self.events.put(("error", str(exc)))
-
-    def _check_for_updates(self):
-        if not getattr(sys, "frozen", False):
-            return
-
-        threading.Thread(target=self._update_worker, daemon=True).start()
-
-    def _update_worker(self):
-        try:
-            release = fetch_latest_release()
-            latest_version = release.get("tag_name", "")
-            if not is_newer_version(latest_version, APP_VERSION):
-                return
-
-            asset = find_release_asset(release, RELEASE_ASSET_NAME)
-            if not asset:
-                return
-
-            self.events.put(("status", f"Updating to {latest_version}..."))
-            downloaded_exe = download_update_asset(asset["browser_download_url"])
-            self.events.put(("update_ready", latest_version, str(downloaded_exe)))
-        except (OSError, URLError, ValueError, KeyError, json.JSONDecodeError):
-            return
-
-    def _progress_hook(self, data):
-        if self.cancel_event.is_set():
-            raise get_download_cancelled()("Download cancelled.")
-
-        self._sync_download_position(data)
-
-        if data.get("status") == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            downloaded = data.get("downloaded_bytes") or 0
-            percent = (downloaded / total * 100) if total else 0
-            speed = data.get("_speed_str", "").strip()
-            count = self._download_count_prefix()
-            self.events.put(("progress", percent, f"{count}Downloading... {percent:.1f}% {speed}".strip()))
-        elif data.get("status") == "finished":
-            count = self._download_count_prefix()
-            self.events.put(("progress", 100, f"{count}Processing downloaded media..."))
-            self.download_completed = max(self.download_completed, self.download_current)
-
-    def _status(self, text):
-        self.events.put(("status", text))
-
-    def _sync_download_position(self, data):
-        info = data.get("info_dict") or {}
-        playlist_total = (
-            info.get("playlist_count")
-            or info.get("n_entries")
-            or data.get("playlist_count")
-            or data.get("n_entries")
-        )
-        playlist_index = info.get("playlist_index") or data.get("playlist_index")
-
-        if isinstance(playlist_total, int) and playlist_total > self.download_total:
-            self.download_total = playlist_total
-        if isinstance(playlist_index, int) and playlist_index > 0:
-            self.download_current = playlist_index
-        elif self.download_total:
-            self.download_current = min(self.download_completed + 1, self.download_total)
-
-    def _download_count_prefix(self):
-        if self.download_total <= 1:
-            return ""
-        current = self.download_current or min(self.download_completed + 1, self.download_total)
-        return f"{current}/{self.download_total} "
-
-    def _process_events(self):
-        try:
-            while True:
-                event = self.events.get_nowait()
-                kind = event[0]
-                if kind == "progress":
-                    self.progress_var.set(event[1])
-                    self._set_status(event[2])
-                elif kind == "status":
-                    if "Converting" in event[1]:
-                        self._set_phase("converting")
-                    self._set_status(event[1])
-                elif kind == "update_ready":
-                    self._set_status(f"Installing update {event[1]}...")
-                    install_update_and_restart(Path(event[2]))
-                    self.destroy()
-                    return
-                elif kind == "done":
-                    self.progress_var.set(100)
-                    self._set_phase("done")
-                    self._set_status(event[1])
-                    self._set_busy(False)
-                elif kind == "cancelled":
-                    self._set_phase("cancelled")
-                    self._set_status(event[1])
-                    self._set_busy(False)
-                elif kind == "error":
-                    self._set_phase("error")
-                    self._set_status("Download failed.")
-                    self._set_busy(False)
-                    self._show_dialog("Download Failed", event[1], "error")
-        except queue.Empty:
-            pass
-        self.after(100, self._process_events)
-
-    def _set_busy(self, busy):
-        state = tk.DISABLED if busy else tk.NORMAL
-        self.video_button.configure(state=state)
-        self.mp3_button.configure(state=state)
-        self.gif_button.configure(state=state)
-        self.frames_button.configure(state=state)
-        self.choose_button.configure(state=state)
-        self.cancel_button.configure(state=tk.NORMAL if busy else tk.DISABLED)
-
-    def _set_status(self, text):
-        self.status_var.set(text or "No downloads currently")
-
-    def _set_phase(self, phase):
-        settings = {
-            "downloading": {
-                "text": "DOWNLOADING",
-                "bg": "#052e16",
-                "fg": "#86efac",
-                "style": "Download.Horizontal.TProgressbar",
-            },
-            "converting": {
-                "text": "CONVERTING",
-                "bg": "#052e16",
-                "fg": "#86efac",
-                "style": "Convert.Horizontal.TProgressbar",
-            },
-            "done": {
-                "text": "DOWNLOAD COMPLETE",
-                "bg": "#082f49",
-                "fg": "#93c5fd",
-                "style": "Done.Horizontal.TProgressbar",
-            },
-            "cancelled": {
-                "text": "DOWNLOAD CANCELLED",
-                "bg": "#292524",
-                "fg": "#d6d3d1",
-                "style": "Error.Horizontal.TProgressbar",
-            },
-            "error": {
-                "text": "DOWNLOAD FAILED",
-                "bg": "#450a0a",
-                "fg": "#fca5a5",
-                "style": "Error.Horizontal.TProgressbar",
-            },
-        }[phase]
-        self.phase_var.set(settings["text"])
-        self.phase_label.configure(bg=settings["bg"], fg=settings["fg"], highlightbackground="#374151")
-        self.progress.configure(style=settings["style"])
-
-    def _open_download_folder(self):
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        os.startfile(DOWNLOAD_DIR)
-
-    def _show_dialog(self, title, message, kind="info"):
-        colors = {
-            "done": ("#082f49", "#93c5fd"),
-            "error": ("#450a0a", "#fca5a5"),
-            "info": ("#172033", "#e5e7eb"),
-        }
-        header_bg, header_fg = colors.get(kind, colors["info"])
-
-        dialog = tk.Toplevel(self)
-        dialog.title(title)
-        dialog.configure(bg="#111827")
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        frame = tk.Frame(dialog, bg="#111827", padx=20, pady=18)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-
-        header = tk.Label(
-            frame,
-            text=title.upper(),
-            anchor="center",
-            font=("Segoe UI", 12, "bold"),
-            bg=header_bg,
-            fg=header_fg,
-            padx=12,
-            pady=8,
-            highlightthickness=1,
-            highlightbackground="#374151",
-        )
-        header.grid(row=0, column=0, sticky="ew")
-
-        body = tk.Label(
-            frame,
-            text=message,
-            anchor="w",
-            justify="left",
-            wraplength=460,
-            font=("Segoe UI", 10),
-            bg="#111827",
-            fg="#d1d5db",
-            padx=2,
-            pady=16,
-        )
-        body.grid(row=1, column=0, sticky="ew")
-
-        ok_button = tk.Button(
-            frame,
-            text="OK",
-            command=dialog.destroy,
-            font=("Segoe UI", 10, "bold"),
-            bg="#1f2937",
-            fg="#f9fafb",
-            activebackground="#374151",
-            activeforeground="#f9fafb",
-            relief=tk.FLAT,
-            padx=24,
-            pady=8,
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#4b5563",
-        )
-        ok_button.grid(row=2, column=0, sticky="e")
-        ok_button.focus_set()
-        dialog.bind("<Return>", lambda _event: dialog.destroy())
-        dialog.bind("<Escape>", lambda _event: dialog.destroy())
-
-        self.update_idletasks()
-        dialog.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-
 def extract_urls(text):
     urls = []
     for match in URL_PATTERN.findall(text):
@@ -627,6 +57,216 @@ def extract_local_files(text, urls):
     return files
 
 
+def inspect_output_name(input_text, collection_progress_callback=None):
+    urls = extract_urls(input_text)
+    local_files = extract_local_files(input_text, urls)
+    if len(local_files) == 1 and not urls:
+        return local_files[0].name, None, format_local_media_details(local_files[0]), []
+    if len(urls) != 1 or local_files:
+        return None, "Paste one video link or choose one media file to load a default filename.", None, []
+
+    if is_x_or_twitter_url(urls[0]):
+        fallback = extract_twitter_fallback(urls[0])
+        if fallback:
+            quality = fallback.get("quality") or probe_media_quality(fallback["video_url"])
+            return fallback_output_name(fallback), None, quality or "No video detected", []
+
+    try:
+        info = extract_download_info(urls[0], collection_progress_callback)
+    except Exception:
+        fallback = extract_twitter_fallback(urls[0]) if is_x_or_twitter_url(urls[0]) else None
+        if not fallback:
+            raise
+        quality = fallback.get("quality") or probe_media_quality(fallback["video_url"])
+        return fallback_output_name(fallback), None, quality or "No video detected", []
+    if collection_title(info):
+        summary, entries = format_playlist_details(info)
+        return safe_folder_name(str(collection_title(info))), None, summary, entries
+    title = safe_folder_name(str(info.get("title") or "Media Download"))
+    return f"{title}.mp4", None, format_media_details(info), []
+
+
+def format_duration(seconds):
+    if seconds is None:
+        return None
+    try:
+        total = max(0, round(float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def format_media_details(info):
+    duration = format_duration(info.get("duration")) if isinstance(info, dict) else None
+    quality = format_quality_preview(info)
+    estimated_size = format_estimated_size(estimate_media_size_bytes(info))
+    return " · ".join(part for part in (duration, quality, estimated_size) if part and part != "No video detected") or "No video detected"
+
+
+def format_local_media_details(path):
+    duration = format_duration(media_duration_seconds(path))
+    quality = probe_media_quality(str(path))
+    return " · ".join(part for part in (duration, quality) if part) or "No video detected"
+
+
+def format_playlist_details(info):
+    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+    total_duration = sum(float(entry.get("duration") or 0) for entry in entries)
+    declared_count = positive_int(info.get("playlist_count") or info.get("n_entries"))
+    entry_count = declared_count or len(entries)
+    summary_parts = [f"{entry_count} videos"]
+    if total_duration:
+        summary_parts.append(f"{format_duration(total_duration)} total")
+    total_size = sum(filter(None, (estimate_media_size_bytes(entry) for entry in entries)))
+    estimated_size = format_estimated_size(total_size)
+    if estimated_size:
+        summary_parts.append(estimated_size)
+    summary_parts.append("Quality varies by entry")
+    details = []
+    for index, entry in enumerate(entries, start=1):
+        title = safe_folder_name(str(entry.get("title") or f"Video {index}"))
+        details.append(f"{index}. {title} · {format_media_details(entry)}")
+    return " · ".join(summary_parts), details
+
+
+def format_quality_preview(info):
+    formats = info.get("formats") if isinstance(info, dict) else None
+    if not isinstance(formats, list):
+        height = info.get("height") if isinstance(info, dict) else None
+        width = info.get("width") if isinstance(info, dict) else None
+        fps = info.get("fps") if isinstance(info, dict) else None
+        bitrate = info.get("tbr") or info.get("vbr") if isinstance(info, dict) else None
+        resolution = f"{height}p" if height else (f"{width}px" if width else None)
+        parts = [resolution]
+        if fps:
+            parts.append(f"{float(fps):g} fps")
+        if bitrate:
+            parts.append(f"{float(bitrate) / 1000:g} Mbps")
+        return " · ".join(part for part in parts if part) or "No video detected"
+
+    best = best_video_format(formats)
+    if not best:
+        return "Audio only"
+
+    height = best.get("height")
+    width = best.get("width")
+    resolution = f"{height}p" if height else f"{width}px"
+    fps = best.get("fps")
+    bitrate = best.get("tbr") or best.get("vbr")
+    parts = [resolution]
+    if fps:
+        parts.append(f"{fps:g} fps")
+    if bitrate:
+        parts.append(f"{bitrate / 1000:g} Mbps")
+    return " - ".join(parts)
+
+
+def best_video_format(formats):
+    video_formats = [
+        item for item in formats
+        if isinstance(item, dict) and item.get("vcodec") not in (None, "none") and (item.get("height") or item.get("width"))
+    ]
+    return max(
+        video_formats,
+        key=lambda item: (
+            item.get("height") or 0,
+            item.get("width") or 0,
+            item.get("fps") or 0,
+            item.get("tbr") or item.get("vbr") or 0,
+        ),
+        default=None,
+    )
+
+
+def estimate_media_size_bytes(info):
+    if not isinstance(info, dict):
+        return None
+
+    formats = info.get("formats")
+    duration = info.get("duration")
+    if not isinstance(formats, list):
+        return estimate_format_size_bytes(info, duration)
+
+    video = best_video_format(formats)
+    if not video:
+        return estimate_format_size_bytes(info, duration)
+
+    selected_formats = [video]
+    if video.get("acodec") in (None, "none"):
+        audio_formats = [
+            item for item in formats
+            if isinstance(item, dict) and item.get("acodec") not in (None, "none") and item.get("vcodec") in (None, "none")
+        ]
+        best_audio = max(audio_formats, key=lambda item: item.get("abr") or item.get("tbr") or 0, default=None)
+        if best_audio:
+            selected_formats.append(best_audio)
+
+    estimates = [estimate_format_size_bytes(media_format, duration) for media_format in selected_formats]
+    if not any(estimates):
+        return None
+    return sum(size for size in estimates if size)
+
+
+def estimate_format_size_bytes(media_format, duration):
+    for key in ("filesize", "filesize_approx"):
+        size = media_format.get(key)
+        if isinstance(size, (int, float)) and size > 0:
+            return int(size)
+    try:
+        seconds = float(duration)
+        bitrate_kbps = float(media_format.get("tbr") or media_format.get("vbr") or media_format.get("abr") or 0)
+    except (TypeError, ValueError):
+        return None
+    return int(seconds * bitrate_kbps * 1000 / 8) if seconds > 0 and bitrate_kbps > 0 else None
+
+
+def format_estimated_size(size_bytes):
+    if not isinstance(size_bytes, (int, float)) or size_bytes <= 0:
+        return None
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            precision = 0 if unit == "B" else (2 if value < 10 else 1)
+            return f"~{value:.{precision}f} {unit}"
+        value /= 1024
+
+
+def probe_media_quality(source):
+    try:
+        completed = subprocess.run(
+            [str(find_ffmpeg_exe()), "-hide_banner", "-i", source],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            startupinfo=hidden_startupinfo(),
+            creationflags=hidden_creationflags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    output = completed.stderr
+    video_line = next((line for line in output.splitlines() if "Video:" in line), "")
+    dimensions = re.search(r"(\d{2,5})x(\d{2,5})", video_line)
+    if not dimensions:
+        return None
+    width, height = dimensions.groups()
+    fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", video_line)
+    parts = [f"{height}p"]
+    if fps_match:
+        parts.append(f"{float(fps_match.group(1)):g} fps")
+    bitrate_match = re.search(r"bitrate:\s*(\d+(?:\.\d+)?)\s*kb/s", output)
+    if bitrate_match:
+        parts.append(f"{float(bitrate_match.group(1)) / 1000:g} Mbps")
+    return " - ".join(parts)
+
+
 def normalize_media_url(url):
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -637,7 +277,9 @@ def normalize_media_url(url):
 
 def validate_inputs(urls, local_files):
     if not urls and not local_files:
-        return "Paste at least one valid web link or choose a media file."
+        return "Paste one valid web link or choose a media file."
+    if len(urls) > 1:
+        return "Only one web link can be downloaded at a time. Use a playlist link for multiple videos."
 
     for url in urls:
         parsed = urlparse(url)
@@ -686,68 +328,6 @@ def get_imageio_ffmpeg():
     return _IMAGEIO_FFMPEG
 
 
-def fetch_latest_release():
-    request = Request(
-        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-        },
-    )
-    with urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def is_newer_version(latest, current):
-    return parse_version(latest) > parse_version(current)
-
-
-def parse_version(version):
-    cleaned = version.strip().lower().lstrip("v")
-    parts = []
-    for part in cleaned.split("."):
-        digits = "".join(char for char in part if char.isdigit())
-        parts.append(int(digits or 0))
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
-
-
-def find_release_asset(release, asset_name):
-    for asset in release.get("assets", []):
-        if asset.get("name") == asset_name and asset.get("browser_download_url"):
-            return asset
-    return None
-
-
-def download_update_asset(url):
-    update_path = Path(tempfile.gettempdir()) / RELEASE_ASSET_NAME
-    request = Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-    with urlopen(request, timeout=60) as response, update_path.open("wb") as output:
-        shutil.copyfileobj(response, output)
-    return update_path
-
-
-def install_update_and_restart(downloaded_exe):
-    current_exe = Path(sys.executable)
-    script = Path(tempfile.gettempdir()) / "media_downloader_update.cmd"
-    script.write_text(
-        "\n".join(
-            [
-                "@echo off",
-                "timeout /t 2 /nobreak >nul",
-                f'copy /y "{downloaded_exe}" "{current_exe}" >nul',
-                f'start "" "{current_exe}"',
-                f'del "{downloaded_exe}" >nul 2>nul',
-                'del "%~f0" >nul 2>nul',
-            ]
-        ),
-        encoding="utf-8",
-    )
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    subprocess.Popen([str(script)], shell=True, creationflags=creationflags)
-
-
 def make_ydl_options(
     progress_hook,
     output_template,
@@ -774,16 +354,17 @@ def make_ydl_options(
     return options
 
 
-def download_best_video(urls, progress_hook, status_callback, cancel_event):
+def download_best_video(urls, progress_hook, status_callback, cancel_event, output_name=None):
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback, "video")
+        target = resolve_download_target(url, status_callback, "video", output_name)
         check_cancelled(cancel_event)
-        output_template = target["directory"] / output_filename_template(target["is_collection"])
+        output_template = target["directory"] / output_filename_template(target["is_collection"], output_name)
         options = make_ydl_options(
             progress_hook,
             output_template,
+            format_selector="bv*+ba/best",
             format_sort=["res", "fps", "br"],
             merge_output_format="mp4",
         )
@@ -793,75 +374,123 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event):
         else:
             status_callback("Downloading best available video...")
 
-        started_at = time.time()
-        if target.get("direct_media_url"):
-            output_path = target["directory"] / direct_media_filename(target, ".mp4")
-            download_direct_media(target["direct_media_url"], output_path, progress_hook)
-            status_callback("Repairing video timestamps...")
-            remux_video_lossless(output_path)
-        else:
+        try:
             with get_yt_dlp().YoutubeDL(options) as ydl:
                 code = ydl.download([target["url"]])
             if code:
                 raise RuntimeError("One or more downloads failed.")
-            status_callback("Repairing video timestamps...")
-            remux_new_videos(target["directory"], started_at)
+        except Exception:
+            fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
+            if not fallback:
+                raise
+            status_callback("Trying alternate video source...")
+            fallback_name = custom_output_stem(output_name) if output_name else custom_output_stem(fallback_output_name(fallback))
+            download_direct_media(fallback["video_url"], target["directory"] / f"{fallback_name}.mp4", progress_hook)
         saved_locations.append(target["directory"])
     return format_saved_locations(saved_locations)
 
 
-def process_local_files(files, mode, status_callback, cancel_event):
+def process_local_files(files, mode, status_callback, cancel_event, conversion_callback=None, output_name=None):
     outputs = []
     total = len(files)
     for index, file_path in enumerate(files, start=1):
         check_cancelled(cancel_event)
         suffix = file_path.suffix.lower()
 
-        if mode == "video":
+        if mode == "fix-video":
+            if suffix not in VIDEO_SOURCE_SUFFIXES:
+                raise RuntimeError(f"{file_path.name} is not a supported video file to repair.")
+            status_callback(f"Repairing video {index}/{total}...")
+            outputs.append(repair_video_for_playback(file_path, replace_original=False, output_name=output_name))
+        elif mode == "video":
             if suffix == ".gif":
-                status_callback(f"Converting GIF to video {index}/{total}...")
-                outputs.append(convert_gif_to_video(file_path, file_path.parent))
+                conversion_status = f"Converting GIF to video {index}/{total}..."
+                status_callback(conversion_status)
+                outputs.append(
+                    convert_gif_to_video(
+                        file_path,
+                        file_path.parent,
+                        progress_callback=(lambda percent, status=conversion_status: conversion_callback(percent, f"{status} {percent:.0f}%")) if conversion_callback else None,
+                        cancel_event=cancel_event,
+                    )
+                )
             elif suffix in VIDEO_SOURCE_SUFFIXES:
-                status_callback(f"Repairing video {index}/{total}...")
-                outputs.append(repair_video_for_playback(file_path, replace_original=False))
+                raise RuntimeError(f"{file_path.name} is already a video. Use Fix Video to repair it.")
             else:
                 raise RuntimeError(f"{file_path.name} cannot be converted or repaired as video.")
         elif mode == "gif":
             if suffix not in VIDEO_SOURCE_SUFFIXES:
                 raise RuntimeError(f"{file_path.name} is not a supported video file for GIF conversion.")
-            status_callback(f"Converting to GIF {index}/{total}...")
-            outputs.append(convert_source_to_gif(file_path, file_path.parent, delete_source=False))
-        elif mode == "frames":
+            conversion_status = f"Converting to GIF {index}/{total}...{gif_size_warning(file_path)}"
+            status_callback(conversion_status)
+            def report_local_progress(percent, stage=None, status=conversion_status):
+                display_status = stage or status
+                if percent is not None:
+                    display_status = f"{display_status} {percent:.0f}%"
+                conversion_callback(percent, display_status)
+
+            outputs.append(
+                convert_source_to_gif(
+                    file_path,
+                    file_path.parent,
+                    delete_source=False,
+                    progress_callback=report_local_progress if conversion_callback else None,
+                    cancel_event=cancel_event,
+                    output_name=output_name,
+                )
+            )
+        elif mode in {"frames", "frame-first", "frames-similar"}:
             if suffix not in FRAME_SOURCE_SUFFIXES:
                 raise RuntimeError(f"{file_path.name} is not a supported video or GIF file for frame extraction.")
-            status_callback(f"Extracting frames {index}/{total}...")
-            outputs.append(extract_unique_frames(file_path, DOWNLOAD_DIR))
+            extraction_status = "Removing similar frames..." if mode == "frames-similar" else (f"Extracting first frame {index}/{total}..." if mode == "frame-first" else f"Extracting frames {index}/{total}...")
+            status_callback(extraction_status)
+            extract = extract_first_frame if mode == "frame-first" else (extract_similar_frames if mode == "frames-similar" else extract_unique_frames)
+            outputs.append(
+                extract(
+                    file_path,
+                    DOWNLOAD_DIR,
+                    progress_callback=(lambda percent, status=extraction_status: conversion_callback(percent, f"{status} {percent:.0f}%", "extracting")) if conversion_callback else None,
+                    cancel_event=cancel_event,
+                    output_name=output_name,
+                )
+            )
         else:
             if suffix == ".mp3":
                 raise RuntimeError(f"{file_path.name} is already an MP3 file.")
             if suffix not in MEDIA_SOURCE_SUFFIXES and suffix != ".gif":
                 raise RuntimeError(f"{file_path.name} is not a supported media file for audio extraction.")
-            status_callback(f"Converting to MP3 {index}/{total}...")
-            outputs.append(convert_source_to_mp3(file_path, file_path.parent, delete_source=False))
+            conversion_status = f"Converting to MP3 {index}/{total}..."
+            status_callback(conversion_status)
+            outputs.append(
+                convert_source_to_mp3(
+                    file_path,
+                    file_path.parent,
+                    delete_source=False,
+                    progress_callback=(lambda percent, status=conversion_status: conversion_callback(percent, f"{status} {percent:.0f}%")) if conversion_callback else None,
+                    cancel_event=cancel_event,
+                    output_name=output_name,
+                )
+            )
 
     return ", ".join(str(output) for output in outputs)
 
 
-def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
-    converted = 0
+def download_best_gifs(urls, progress_hook, status_callback, cancel_event, conversion_callback=None, output_name=None):
+    saved = 0
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback, "gif")
+        target = resolve_download_target(url, status_callback, "gif", output_name)
         check_cancelled(cancel_event)
         with tempfile.TemporaryDirectory(prefix="media-downloader-") as temp_dir:
             temp_dir_path = Path(temp_dir)
+            used_twitter_fallback = False
             temp_template = temp_dir_path / output_source_filename_template(target["is_collection"])
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_sort=["res", "fps", "br"],
-                merge_output_format="mp4",
+                format_selector="best",
+                merge_output_format=None,
             )
 
             if target["is_collection"]:
@@ -869,40 +498,76 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event):
             else:
                 status_callback("Downloading source media for GIF conversion...")
 
-            if target.get("direct_media_url"):
-                source = temp_dir_path / direct_media_filename(target, ".source.mp4")
-                download_direct_media(target["direct_media_url"], source, progress_hook)
-            else:
+            try:
                 with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
                 if code:
                     raise RuntimeError("One or more downloads failed before GIF conversion.")
+            except Exception:
+                fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
+                if not fallback:
+                    raise
+                status_callback("Trying alternate video source for GIF conversion...")
+                fallback_stem = custom_output_stem(fallback_output_name(fallback))
+                download_direct_media(fallback["video_url"], temp_dir_path / f"{fallback_stem}.source.mp4", progress_hook)
+                used_twitter_fallback = True
 
             source_files = sorted(
                 path
                 for path in temp_dir_path.rglob("*")
-                if path.is_file() and path.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}
+                if path.is_file() and path.suffix.lower() in VIDEO_SOURCE_SUFFIXES | {".gif"}
             )
             if not source_files:
-                raise RuntimeError("No downloaded video files were found to convert.")
+                raise RuntimeError("No downloaded media files were found for GIF saving or conversion.")
+
+            if used_twitter_fallback:
+                status_callback("Preparing video for GIF conversion...")
+                source_files = [
+                    remux_video_lossless(source, replace_original=True) if source.suffix.lower() != ".gif" else source
+                    for source in source_files
+                ]
 
             total = len(source_files)
             for index, source in enumerate(source_files, start=1):
                 check_cancelled(cancel_event)
-                status_callback(f"Converting to GIF {index}/{total}...")
-                convert_source_to_gif(source, target["directory"])
-                converted += 1
+                if source.suffix.lower() == ".gif":
+                    status_callback(f"Saving GIF {index}/{total}...")
+                    save_existing_gif(
+                        source,
+                        target["directory"],
+                        output_name if not target["is_collection"] else None,
+                    )
+                else:
+                    conversion_status = f"Converting to GIF {index}/{total}...{gif_size_warning(source)}"
+                    status_callback(conversion_status)
+                    item_offset = (index - 1) / total * 100
+                    item_scale = 100 / total
+                    def report_item_progress(percent, stage=None, offset=item_offset, scale=item_scale, status=conversion_status):
+                        overall_percent = None if percent is None else offset + percent * scale / 100
+                        display_status = stage or status
+                        if overall_percent is not None:
+                            display_status = f"{display_status} {overall_percent:.0f}%"
+                        conversion_callback(overall_percent, display_status)
+
+                    convert_source_to_gif(
+                        source,
+                        target["directory"],
+                        progress_callback=report_item_progress if conversion_callback else None,
+                        cancel_event=cancel_event,
+                        output_name=None if target["is_collection"] else output_name,
+                    )
+                saved += 1
             saved_locations.append(target["directory"])
 
-    return f"{format_saved_locations(saved_locations)} ({converted} GIF file{'s' if converted != 1 else ''})"
+    return f"{format_saved_locations(saved_locations)} ({saved} GIF file{'s' if saved != 1 else ''})"
 
 
-def download_best_frames(urls, progress_hook, status_callback, cancel_event):
+def download_best_frames(urls, progress_hook, status_callback, cancel_event, conversion_callback=None, first_frame=False, similar_frames=False, output_name=None):
     extracted = 0
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback, "frames")
+        target = resolve_download_target(url, status_callback, "frames", output_name)
         check_cancelled(cancel_event)
         with tempfile.TemporaryDirectory(prefix="media-downloader-") as temp_dir:
             temp_dir_path = Path(temp_dir)
@@ -910,8 +575,8 @@ def download_best_frames(urls, progress_hook, status_callback, cancel_event):
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_sort=["res", "fps", "br"],
-                merge_output_format="mp4",
+                format_selector="best",
+                merge_output_format=None,
             )
 
             if target["is_collection"]:
@@ -919,14 +584,17 @@ def download_best_frames(urls, progress_hook, status_callback, cancel_event):
             else:
                 status_callback("Downloading source media for frame extraction...")
 
-            if target.get("direct_media_url"):
-                source = temp_dir_path / direct_media_filename(target, ".source.mp4")
-                download_direct_media(target["direct_media_url"], source, progress_hook)
-            else:
+            try:
                 with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
                 if code:
                     raise RuntimeError("One or more downloads failed before frame extraction.")
+            except Exception:
+                fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
+                if not fallback:
+                    raise
+                status_callback("Trying alternate video source for frame extraction...")
+                download_direct_media(fallback["video_url"], temp_dir_path / f"{custom_output_stem(fallback_output_name(fallback))}.source.mp4", progress_hook)
 
             source_files = sorted(
                 path
@@ -939,20 +607,28 @@ def download_best_frames(urls, progress_hook, status_callback, cancel_event):
             total = len(source_files)
             for index, source in enumerate(source_files, start=1):
                 check_cancelled(cancel_event)
-                status_callback(f"Extracting frames {index}/{total}...")
-                extract_unique_frames(source, target["directory"])
+                extraction_status = "Removing similar frames..." if similar_frames else (f"Extracting first frame {index}/{total}..." if first_frame else f"Extracting frames {index}/{total}...")
+                status_callback(extraction_status)
+                extract = extract_first_frame if first_frame else (extract_similar_frames if similar_frames else extract_unique_frames)
+                extract(
+                    source,
+                    target["directory"],
+                    progress_callback=(lambda percent, status=extraction_status: conversion_callback(percent, f"{status} {percent:.0f}%", "extracting")) if conversion_callback else None,
+                    cancel_event=cancel_event,
+                    output_name=None if target["is_collection"] else output_name,
+                )
                 extracted += 1
             saved_locations.append(target["directory"])
 
     return f"{format_saved_locations(saved_locations)} ({extracted} frame folder{'s' if extracted != 1 else ''})"
 
 
-def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
+def download_best_mp3s(urls, progress_hook, status_callback, cancel_event, conversion_callback=None, output_name=None):
     converted = 0
     saved_locations = []
     for url in urls:
         check_cancelled(cancel_event)
-        target = resolve_download_target(url, status_callback, "audio")
+        target = resolve_download_target(url, status_callback, "audio", output_name)
         check_cancelled(cancel_event)
         with tempfile.TemporaryDirectory(prefix="media-downloader-") as temp_dir:
             temp_dir_path = Path(temp_dir)
@@ -969,14 +645,17 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
             else:
                 status_callback("Downloading audio for MP3 conversion...")
 
-            if target.get("direct_media_url"):
-                source = temp_dir_path / direct_media_filename(target, ".source.mp4")
-                download_direct_media(target["direct_media_url"], source, progress_hook)
-            else:
+            try:
                 with get_yt_dlp().YoutubeDL(options) as ydl:
                     code = ydl.download([target["url"]])
                 if code:
                     raise RuntimeError("One or more downloads failed before MP3 conversion.")
+            except Exception:
+                fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
+                if not fallback:
+                    raise
+                status_callback("Trying alternate video source for audio conversion...")
+                download_direct_media(fallback["video_url"], temp_dir_path / f"{custom_output_stem(fallback_output_name(fallback))}.source.mp4", progress_hook)
 
             source_files = sorted(
                 path
@@ -989,43 +668,33 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event):
             total = len(source_files)
             for index, source in enumerate(source_files, start=1):
                 check_cancelled(cancel_event)
-                status_callback(f"Converting to MP3 {index}/{total}...")
-                convert_source_to_mp3(source, target["directory"])
+                conversion_status = f"Converting to MP3 {index}/{total}..."
+                status_callback(conversion_status)
+                convert_source_to_mp3(
+                    source,
+                    target["directory"],
+                    progress_callback=(lambda percent, status=conversion_status: conversion_callback(percent, f"{status} {percent:.0f}%")) if conversion_callback else None,
+                    cancel_event=cancel_event,
+                    output_name=None if target["is_collection"] else output_name,
+                )
                 converted += 1
             saved_locations.append(target["directory"])
 
     return f"{format_saved_locations(saved_locations)} ({converted} MP3 file{'s' if converted != 1 else ''})"
 
 
-def download_best_gif(url, progress_hook, status_callback):
-    temp_template = DOWNLOAD_DIR / "%(title).120B [%(id)s].source.%(ext)s"
-    options = make_ydl_options(progress_hook, temp_template, allow_playlists=False)
-    with get_yt_dlp().YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        source = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
-        if not source.exists():
-            requested = info.get("requested_downloads") or []
-            if requested:
-                source = Path(requested[0].get("filepath", source))
-
-    if not source.exists():
-        raise RuntimeError("The video downloaded, but the saved file could not be found.")
-
-    status_callback("Converting to GIF...")
-    gif_path = convert_source_to_gif(source, DOWNLOAD_DIR)
-    return gif_path
-
-
-def output_filename_template(is_collection):
+def output_filename_template(is_collection, output_name=None):
     if is_collection:
-        return "%(playlist_index)03d - %(title).120B [%(id)s].%(ext)s"
-    return "%(title).120B [%(id)s].%(ext)s"
+        return "%(playlist_index)03d - %(title).120B.%(ext)s"
+    if output_name:
+        return f"{custom_output_stem(output_name)}.%(ext)s"
+    return "%(title).120B.%(ext)s"
 
 
 def output_source_filename_template(is_collection):
     if is_collection:
-        return "%(playlist_index)03d - %(title).120B [%(id)s].source.%(ext)s"
-    return "%(title).120B [%(id)s].source.%(ext)s"
+        return "%(playlist_index)03d - %(title).120B.source.%(ext)s"
+    return "%(title).120B.source.%(ext)s"
 
 
 def check_cancelled(cancel_event):
@@ -1033,39 +702,61 @@ def check_cancelled(cancel_event):
         raise get_download_cancelled()("Download cancelled.")
 
 
-def resolve_download_target(url, status_callback, mode):
+def resolve_download_target(url, status_callback, mode, output_name=None):
     normalized_url = normalize_media_url(url)
     if not is_probable_collection_url(normalized_url):
-        if is_x_or_twitter_url(normalized_url):
-            fallback = extract_twitter_fallback(normalized_url)
-            if fallback:
-                return direct_download_target(normalized_url, fallback)
         return fast_download_target(normalized_url)
+
+    if is_youtube_playlist_url(normalized_url):
+        return resolve_legacy_youtube_playlist_target(normalized_url, status_callback, mode, output_name)
+
+    # Reuse the previewed collection name so the real download can go straight
+    # through yt-dlp's playlist path without another full metadata scan.
+    if output_name:
+        folder_name = custom_folder_name(output_name)
+        directory = unique_path(DOWNLOAD_DIR / folder_name)
+        directory.mkdir(parents=True, exist_ok=True)
+        return {"directory": directory, "is_collection": True, "name": folder_name, "url": normalized_url}
 
     status_callback("Scanning link details...")
     try:
         info = extract_download_info(normalized_url)
     except Exception as exc:
-        if is_x_or_twitter_url(normalized_url):
-            fallback = extract_twitter_fallback(normalized_url)
-            if fallback:
-                return direct_download_target(normalized_url, fallback)
         raise RuntimeError(media_detection_error(normalized_url, mode, exc)) from exc
 
     if not has_media_for_mode(info, mode):
-        if is_x_or_twitter_url(normalized_url):
-            fallback = extract_twitter_fallback(normalized_url)
-            if fallback:
-                return direct_download_target(normalized_url, fallback)
         raise RuntimeError(no_media_message(normalized_url, mode))
 
     collection_name = collection_title(info)
     if collection_name:
-        directory = unique_path(DOWNLOAD_DIR / safe_folder_name(collection_name))
+        folder_name = custom_folder_name(output_name) if output_name else safe_folder_name(collection_name)
+        directory = unique_path(DOWNLOAD_DIR / folder_name)
         directory.mkdir(parents=True, exist_ok=True)
         return {"directory": directory, "is_collection": True, "name": collection_name, "url": normalized_url}
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": normalized_url}
+
+
+def resolve_legacy_youtube_playlist_target(url, status_callback, mode, output_name=None):
+    # Keep YouTube playlists on the original pre-Photino route: one playlist
+    # read when Download is clicked, then yt-dlp performs the normal download.
+    status_callback("Scanning link details...")
+    try:
+        info = extract_legacy_youtube_playlist_info(url)
+    except Exception as exc:
+        raise RuntimeError(media_detection_error(url, mode, exc)) from exc
+
+    if not has_media_for_mode(info, mode):
+        raise RuntimeError(no_media_message(url, mode))
+
+    collection_name = collection_title(info)
+    if collection_name:
+        folder_name = custom_folder_name(output_name) if output_name else safe_folder_name(collection_name)
+        directory = unique_path(DOWNLOAD_DIR / folder_name)
+        directory.mkdir(parents=True, exist_ok=True)
+        return {"directory": directory, "is_collection": True, "name": collection_name, "url": url}
+
+    return fast_download_target(url)
 
 
 def fast_download_target(url):
@@ -1073,21 +764,8 @@ def fast_download_target(url):
     return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": url}
 
 
-def direct_download_target(url, fallback):
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    return {
-        "directory": DOWNLOAD_DIR,
-        "is_collection": False,
-        "name": fallback.get("title") or twitter_status_id(url) or "Twitter media",
-        "url": url,
-        "direct_media_url": fallback["video_url"],
-        "id": twitter_status_id(url) or "twitter",
-    }
-
-
 def is_probable_collection_url(url):
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
     path = parsed.path.lower()
     query = parsed.query.lower()
 
@@ -1106,10 +784,95 @@ def is_probable_collection_url(url):
     )
     if any(marker in path for marker in collection_markers):
         return True
-    return "soundcloud.com" in host and "/sets/" in path
+
+    # Creator and channel upload pages use different URL structures across
+    # sites, but their final segment is usually a generic collection label.
+    # We still verify the extracted result has multiple entries before making
+    # a collection folder, so this does not hard-code any individual site.
+    collection_endings = {"videos", "uploads", "media", "clips", "reels", "shorts"}
+    path_segments = [segment for segment in path.split("/") if segment]
+    return bool(path_segments and path_segments[-1] in collection_endings)
 
 
-def extract_download_info(url):
+def is_youtube_playlist_url(url):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    return (host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be") and "list=" in parsed.query.lower()
+
+
+def extract_download_info(url, collection_progress_callback=None):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "windowsfilenames": True,
+        # A collection can contain unavailable, private, or temporarily gated
+        # entries. Keep inspecting the remaining entries instead of treating
+        # the entire collection as empty.
+        "ignoreerrors": True,
+    }
+    # A preview needs the collection list, not a full format lookup for every
+    # video. The actual download still uses the normal highest-quality path.
+    if collection_progress_callback and is_probable_collection_url(url):
+        options["extract_flat"] = "in_playlist"
+    ydl_class = get_yt_dlp().YoutubeDL
+    if collection_progress_callback:
+        base_class = ydl_class
+
+        class CollectionInspectionYoutubeDL(base_class):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._found_entries = 0
+                self._expected_entries = None
+
+            def _report_collection_progress(self):
+                try:
+                    collection_progress_callback(self._found_entries, self._expected_entries)
+                except Exception:
+                    pass
+
+            def to_screen(self, message, *args, **kwargs):
+                # Observe yt-dlp's own discovery messages without changing its
+                # playlist-processing path. Some extractors repeat lower item
+                # numbers while resolving a source, so retain only the highest
+                # valid position for the first detected collection.
+                item_match = re.search(r"Downloading item\s+(\d+)\s+of\s+(\d+|N/A)", str(message))
+                total_match = re.search(r"Playlist .+: Downloading\s+(\d+|N/A)\s+items", str(message))
+                changed = False
+                if total_match and self._expected_entries is None:
+                    total_text = total_match.group(1)
+                    self._expected_entries = int(total_text) if total_text.isdigit() else None
+                    changed = True
+                if item_match:
+                    item_number = int(item_match.group(1))
+                    total_text = item_match.group(2)
+                    item_total = int(total_text) if total_text.isdigit() else None
+                    if self._expected_entries is None and item_total:
+                        self._expected_entries = item_total
+                        changed = True
+                    if not self._expected_entries or item_number <= self._expected_entries:
+                        previous_count = self._found_entries
+                        self._found_entries = max(self._found_entries, item_number)
+                        changed = changed or self._found_entries != previous_count
+                if changed:
+                    self._report_collection_progress()
+                return super().to_screen(message, *args, **kwargs)
+
+        ydl_class = CollectionInspectionYoutubeDL
+
+    with ydl_class(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if is_probable_collection_url(url) and (not isinstance(info, dict) or is_incomplete_collection_info(info)):
+        flat_options = dict(options)
+        flat_options["extract_flat"] = "in_playlist"
+        with ydl_class(flat_options) as ydl:
+            flat_info = ydl.extract_info(url, download=False)
+        if isinstance(flat_info, dict):
+            return flat_info
+    return info
+
+
+def extract_legacy_youtube_playlist_info(url):
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -1119,50 +882,23 @@ def extract_download_info(url):
         return ydl.extract_info(url, download=False)
 
 
-def extract_twitter_fallback(url):
-    tweet_id = twitter_status_id(url)
-    if not tweet_id:
-        return None
+def is_incomplete_collection_info(info):
+    if not isinstance(info, dict) or info.get("_type") not in {"playlist", "multi_video"}:
+        return False
 
-    request = Request(
-        TWITIGER_EXTRACT_URL + quote(url, safe=""),
-        headers={
-            "Accept": "application/json",
-            "Referer": "https://twitiger.com/",
-            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-        },
-    )
+    expected_count = positive_int(info.get("playlist_count") or info.get("n_entries"))
+    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+    if isinstance(expected_count, int) and expected_count > len(entries):
+        return True
+    return not entries
+
+
+def positive_int(value):
     try:
-        with urlopen(request, timeout=5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, URLError, json.JSONDecodeError):
+        number = int(value)
+    except (TypeError, ValueError):
         return None
-
-    data = payload.get("data") if payload.get("success") else None
-    if not isinstance(data, dict):
-        return None
-
-    media_url = best_twitter_fallback_url(data)
-    if not media_url:
-        return None
-
-    return {
-        "title": data.get("title") or f"Twitter media {tweet_id}",
-        "video_url": media_url,
-    }
-
-
-def best_twitter_fallback_url(data):
-    resolutions = data.get("resolutions") or []
-    for item in resolutions:
-        if isinstance(item, dict) and item.get("videoUrl"):
-            return item["videoUrl"]
-    return data.get("videoUrl") or data.get("downloadUrl")
-
-
-def twitter_status_id(url):
-    match = re.search(r"/(?:i/)?status(?:es)?/(\d+)", url)
-    return match.group(1) if match else None
+    return number if number > 0 else None
 
 
 def has_media_for_mode(info, mode):
@@ -1193,6 +929,11 @@ def format_has_audio(media_format):
 
 def media_detection_error(url, mode, exc):
     message = str(exc)
+    if "Sign in to confirm you're not a bot" in message:
+        return (
+            f"YouTube temporarily blocked access while reading this {mode_label(mode)}. "
+            "Wait a few minutes and try again."
+        )
     if is_x_or_twitter_url(url):
         return (
             f"No downloadable {mode_label(mode)} was found in this X/Twitter post. "
@@ -1225,6 +966,113 @@ def is_x_or_twitter_url(url):
     return host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com")
 
 
+def extract_twitter_fallback(url):
+    tweet_id = twitter_status_id(url)
+    if not tweet_id:
+        return None
+
+    request = Request(
+        TWITIGER_EXTRACT_URL + quote(url, safe=""),
+        headers={
+            "Accept": "application/json",
+            "Referer": "https://twitiger.com/",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        },
+    )
+    # The alternate lookup occasionally returns an empty response even for a
+    # valid post. Retry it briefly instead of surfacing the original yt-dlp error.
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, URLError, json.JSONDecodeError):
+            if attempt < 2:
+                time.sleep(0.35)
+            continue
+
+        data = payload.get("data") if payload.get("success") else None
+        if not isinstance(data, dict):
+            if attempt < 2:
+                time.sleep(0.35)
+            continue
+
+        resolutions = data.get("resolutions") or []
+        media_url = next((item.get("videoUrl") for item in resolutions if isinstance(item, dict) and item.get("videoUrl")), None)
+        media_url = media_url or data.get("videoUrl") or data.get("downloadUrl")
+        if media_url:
+            return {
+                "title": data.get("title") or f"Twitter media {tweet_id}",
+                "video_url": media_url,
+                "quality": format_fallback_quality(resolutions),
+            }
+        if attempt < 2:
+            time.sleep(0.35)
+    return None
+
+
+def validate_output_name(output_name):
+    if not output_name or not output_name.strip():
+        return None
+
+    name = output_name.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    if not name:
+        return "File name cannot be empty."
+    if name.endswith((".", " ")):
+        return "File name cannot end with a period or space."
+
+    stem = Path(name).stem.upper()
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
+    if stem in reserved:
+        return f"{stem} is reserved by Windows and cannot be used as a file name."
+    return None
+
+
+def format_fallback_quality(resolutions):
+    candidates = [item for item in resolutions if isinstance(item, dict) and item.get("videoUrl")]
+    if not candidates:
+        return None
+
+    def numeric(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0
+
+    best = max(
+        candidates,
+        key=lambda item: (
+            numeric(item.get("height")),
+            numeric(item.get("width")),
+            numeric(item.get("fps")),
+            numeric(item.get("bitrate") or item.get("bitRate")),
+        ),
+    )
+    resolution = str(best.get("resolution") or "").strip()
+    if not resolution:
+        height = best.get("height")
+        width = best.get("width")
+        resolution = f"{height}p" if height else (f"{width}px" if width else "")
+    parts = [resolution] if resolution else []
+    fps = best.get("fps")
+    if numeric(fps):
+        parts.append(f"{numeric(fps):g} fps")
+    bitrate = best.get("bitrate") or best.get("bitRate")
+    if numeric(bitrate):
+        parts.append(f"{numeric(bitrate) / 1_000_000:g} Mbps")
+    return " - ".join(parts) or None
+
+
+def twitter_status_id(url):
+    match = re.search(r"/(?:i/)?status(?:es)?/(\d+)", url)
+    return match.group(1) if match else None
+
+
+def fallback_output_name(fallback):
+    title = safe_folder_name(str(fallback.get("title") or "Twitter media"))
+    return f"{title}.mp4"
+
+
 def clean_download_error(message):
     return re.sub(r"^ERROR:\s*", "", message).strip() or "The downloader could not read media from this link."
 
@@ -1235,7 +1083,12 @@ def collection_title(info):
 
     entries = info.get("entries")
     entry_count = len(entries) if isinstance(entries, list) else 0
-    is_collection = info.get("_type") in {"playlist", "multi_video"} or entry_count > 1
+    declared_count = positive_int(info.get("playlist_count") or info.get("n_entries"))
+    is_collection = (
+        info.get("_type") in {"playlist", "multi_video"}
+        or entry_count > 1
+        or (declared_count and declared_count > 1)
+    )
     if not is_collection:
         return None
 
@@ -1244,6 +1097,16 @@ def collection_title(info):
 
 def safe_folder_name(name):
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return cleaned or "Media Download"
+
+
+def custom_output_stem(output_name):
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", output_name.strip()).rstrip(". ")
+    return Path(cleaned).stem
+
+
+def custom_folder_name(output_name):
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", output_name.strip()).rstrip(". ")
     return cleaned or "Media Download"
 
 
@@ -1274,48 +1137,55 @@ def format_download_size(size):
     return f"{size:.1f} {units[unit]}"
 
 
-def direct_media_filename(target, suffix):
-    title = safe_folder_name(target.get("name") or "Twitter media")
-    media_id = target.get("id") or "twitter"
-    return unique_path(Path(f"{title[:120]} [{media_id}]{suffix}")).name
-
-
 def download_direct_media(url, output_path, progress_hook):
     output_path = unique_path(output_path)
-    options = make_ydl_options(
-        progress_hook,
-        output_path,
-        allow_playlists=False,
-        format_selector="best",
-        merge_output_format=None,
+    request = Request(
+        url,
+        headers={
+            "Referer": "https://twitter.com/",
+            "User-Agent": "Mozilla/5.0",
+        },
     )
-    options["http_headers"] = {
-        "Referer": "https://twitter.com/",
-        "User-Agent": "Mozilla/5.0",
-    }
-    with get_yt_dlp().YoutubeDL(options) as ydl:
-        code = ydl.download([url])
-    if code:
-        raise RuntimeError("Direct media download failed.")
+    downloaded = 0
+    started_at = time.monotonic()
+    # Older video.twimg.com hosts can expose an expired certificate chain. Do
+    # not weaken certificate verification for any other direct-media source.
+    host = (urlparse(url).hostname or "").lower()
+    ssl_context = ssl._create_unverified_context() if host == "video.twimg.com" or host.endswith(".video.twimg.com") else ssl.create_default_context()
+    with urlopen(request, timeout=60, context=ssl_context) as response, output_path.open("wb") as output:
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except ValueError:
+            total = 0
+        while True:
+            chunk = response.read(1024 * 256)
+            if not chunk:
+                break
+            output.write(chunk)
+            downloaded += len(chunk)
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            progress_hook(
+                {
+                    "status": "downloading",
+                    "downloaded_bytes": downloaded,
+                    "total_bytes": total,
+                    "_speed_str": f"{format_download_size(downloaded / elapsed)}/s",
+                }
+            )
+    progress_hook({"status": "finished", "downloaded_bytes": downloaded, "total_bytes": total})
     return output_path
 
 
-def remux_new_videos(directory, started_at):
-    candidates = sorted(
-        path
-        for path in directory.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in VIDEO_SOURCE_SUFFIXES
-        and path.stat().st_mtime >= started_at - 2
-    )
-    for path in candidates:
-        remux_video_lossless(path)
-
-
-def repair_video_for_playback(path, replace_original=True):
+def repair_video_for_playback(path, replace_original=True, output_name=None):
     repaired = remux_video_lossless(path, replace_original=replace_original)
     rebuilt = rebuild_video_for_playback(repaired, replace_original=True)
-    return rebuilt or repaired
+    finished = rebuilt or repaired
+    if not replace_original and output_name:
+        named_output = unique_path(path.with_name(f"{custom_output_stem(output_name)}{path.suffix}"))
+        if finished != named_output:
+            finished.replace(named_output)
+        return named_output
+    return finished
 
 
 def remux_video_lossless(path, replace_original=True):
@@ -1420,13 +1290,23 @@ def rebuild_video_for_playback(path, replace_original=True):
         return None
 
 
-def convert_source_to_gif(source, output_dir, delete_source=True):
+def convert_source_to_gif(source, output_dir, delete_source=True, progress_callback=None, cancel_event=None, output_name=None):
     output_dir.mkdir(parents=True, exist_ok=True)
-    gif_path = unique_path(output_dir / source.with_suffix(".gif").name.replace(".source", ""))
+    gif_name = f"{custom_output_stem(output_name)}.gif" if output_name else source.with_suffix(".gif").name.replace(".source", "")
+    gif_path = unique_path(output_dir / gif_name)
     palette = source.with_suffix(".palette.png")
     ffmpeg_exe = find_ffmpeg_exe()
+    duration_seconds = media_duration_seconds(source)
 
+    def report_progress(start, end, stage):
+        if not progress_callback:
+            return None
+        return lambda percent: progress_callback(None if percent is None else start + (end - start) * percent / 100, stage)
+
+    completed = False
     try:
+        if progress_callback:
+            progress_callback(None, "Generating GIF color palette...")
         run_ffmpeg(
             [
                 ffmpeg_exe,
@@ -1436,8 +1316,11 @@ def convert_source_to_gif(source, output_dir, delete_source=True):
                 "-vf",
                 "fps=30,scale=iw:ih:flags=lanczos,palettegen=stats_mode=full",
                 str(palette),
-            ]
+            ],
+            cancel_event=cancel_event,
         )
+        if progress_callback:
+            progress_callback(0, "Rendering GIF...")
         run_ffmpeg(
             [
                 ffmpeg_exe,
@@ -1451,10 +1334,16 @@ def convert_source_to_gif(source, output_dir, delete_source=True):
                 "-loop",
                 "0",
                 str(gif_path),
-            ]
+            ],
+            progress_callback=report_progress(0, 100, "Rendering GIF..."),
+            duration_seconds=duration_seconds,
+            cancel_event=cancel_event,
         )
+        completed = True
     finally:
         temp_files = [palette]
+        if not completed:
+            temp_files.append(gif_path)
         if delete_source:
             temp_files.append(source)
         for temp_file in temp_files:
@@ -1465,10 +1354,19 @@ def convert_source_to_gif(source, output_dir, delete_source=True):
     return gif_path
 
 
-def convert_gif_to_video(source, output_dir):
+def save_existing_gif(source, output_dir, output_name=None):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{custom_output_stem(output_name)}.gif" if output_name else source.name.replace(".source.gif", ".gif")
+    gif_path = unique_path(output_dir / filename)
+    shutil.copy2(source, gif_path)
+    return gif_path
+
+
+def convert_gif_to_video(source, output_dir, progress_callback=None, cancel_event=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     video_path = unique_path(output_dir / f"{source.stem}.mp4")
     ffmpeg_exe = find_ffmpeg_exe()
+    duration_seconds = media_duration_seconds(source)
 
     run_ffmpeg(
         [
@@ -1483,15 +1381,20 @@ def convert_gif_to_video(source, output_dir):
             "-vf",
             "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             str(video_path),
-        ]
+        ],
+        progress_callback=progress_callback,
+        duration_seconds=duration_seconds,
+        cancel_event=cancel_event,
     )
     return video_path
 
 
-def convert_source_to_mp3(source, output_dir, delete_source=True):
+def convert_source_to_mp3(source, output_dir, delete_source=True, progress_callback=None, cancel_event=None, output_name=None):
     output_dir.mkdir(parents=True, exist_ok=True)
-    mp3_path = unique_path(output_dir / source.with_suffix(".mp3").name.replace(".source", ""))
+    mp3_name = f"{custom_output_stem(output_name)}.mp3" if output_name else source.with_suffix(".mp3").name.replace(".source", "")
+    mp3_path = unique_path(output_dir / mp3_name)
     ffmpeg_exe = find_ffmpeg_exe()
+    duration_seconds = media_duration_seconds(source)
 
     try:
         run_ffmpeg(
@@ -1506,7 +1409,10 @@ def convert_source_to_mp3(source, output_dir, delete_source=True):
                 "-q:a",
                 "2",
                 str(mp3_path),
-            ]
+            ],
+            progress_callback=progress_callback,
+            duration_seconds=duration_seconds,
+            cancel_event=cancel_event,
         )
     finally:
         if delete_source:
@@ -1517,11 +1423,12 @@ def convert_source_to_mp3(source, output_dir, delete_source=True):
     return mp3_path
 
 
-def extract_unique_frames(source, output_root):
+def extract_unique_frames(source, output_root, progress_callback=None, cancel_event=None, output_name=None):
     output_root.mkdir(parents=True, exist_ok=True)
-    frame_dir = unique_path(output_root / f"{safe_folder_name(source.stem)} Frames")
+    frame_dir = unique_path(output_root / f"{custom_output_stem(output_name) if output_name else safe_folder_name(source.stem)} Frames")
     frame_dir.mkdir(parents=True, exist_ok=True)
     output_pattern = frame_dir / "frame_%06d.png"
+    duration_seconds = media_duration_seconds(source)
 
     run_ffmpeg(
         [
@@ -1534,14 +1441,84 @@ def extract_unique_frames(source, output_root):
             "-vsync",
             "vfr",
             str(output_pattern),
-        ]
+        ],
+        progress_callback=progress_callback,
+        duration_seconds=duration_seconds,
+        cancel_event=cancel_event,
     )
+    frames_per_second = media_frame_rate(source) or 30
+    for index, frame_path in enumerate(sorted(frame_dir.glob("frame_*.png")), start=1):
+        second_dir = frame_dir / f"Second {(index - 1) // frames_per_second + 1:04d}"
+        second_dir.mkdir(exist_ok=True)
+        shutil.move(str(frame_path), str(second_dir / frame_path.name))
+    return frame_dir
+
+
+def media_frame_rate(source):
+    completed = subprocess.run([str(find_ffmpeg_exe()), "-hide_banner", "-i", str(source)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", startupinfo=hidden_startupinfo(), creationflags=hidden_creationflags())
+    match = re.search(r"(\d+(?:\.\d+)?)\s*fps", completed.stderr)
+    return max(1, round(float(match.group(1)))) if match else None
+
+
+def extract_first_frame(source, output_root, progress_callback=None, cancel_event=None, output_name=None):
+    output_root.mkdir(parents=True, exist_ok=True)
+    frame_path = unique_path(output_root / f"{custom_output_stem(output_name) if output_name else safe_folder_name(source.stem)}.png")
+
+    run_ffmpeg(
+        [
+            find_ffmpeg_exe(),
+            "-y",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            str(frame_path),
+        ],
+        progress_callback=progress_callback,
+        duration_seconds=media_duration_seconds(source),
+        cancel_event=cancel_event,
+    )
+    return frame_path
+
+
+def extract_similar_frames(source, output_root, progress_callback=None, cancel_event=None, output_name=None):
+    from PIL import Image
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    frame_dir = unique_path(output_root / f"{custom_output_stem(output_name) if output_name else safe_folder_name(source.stem)} Similar Frames")
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="media-downloader-frames-") as temp_dir:
+        raw_pattern = Path(temp_dir) / "raw_%06d.png"
+        run_ffmpeg([find_ffmpeg_exe(), "-y", "-i", str(source), str(raw_pattern)], progress_callback=progress_callback, duration_seconds=media_duration_seconds(source), cancel_event=cancel_event)
+        previous = None
+        saved = 0
+        for raw_path in sorted(Path(temp_dir).glob("raw_*.png")):
+            check_cancelled(cancel_event)
+            with Image.open(raw_path) as image:
+                sample = image.convert("L").resize((16, 16))
+                pixels = list(sample.getdata())
+            average = sum(pixels) / len(pixels)
+            frame_hash = sum((1 << index) for index, value in enumerate(pixels) if value >= average)
+            if previous is not None and (frame_hash ^ previous).bit_count() < 14:
+                continue
+            previous = frame_hash
+            saved += 1
+            shutil.move(str(raw_path), str(frame_dir / f"frame_{saved:06d}.png"))
     return frame_dir
 
 
 def unique_path(path):
     if not path.exists():
         return path
+
+    if path.is_dir():
+        parent = path.parent
+        counter = 2
+        while True:
+            candidate = parent / f"{path.name} ({counter})"
+            if not candidate.exists():
+                return candidate
+            counter += 1
 
     stem = path.stem
     suffix = path.suffix
@@ -1578,19 +1555,154 @@ def find_ffmpeg_exe():
     raise RuntimeError("FFmpeg could not be found. Install FFmpeg, then reopen the app.")
 
 
-def run_ffmpeg(args, return_output=False):
+def media_duration_seconds(source):
+    completed = subprocess.run(
+        [str(find_ffmpeg_exe()), "-hide_banner", "-i", str(source)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        startupinfo=hidden_startupinfo(),
+        creationflags=hidden_creationflags(),
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr)
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def media_video_height(source):
+    completed = subprocess.run(
+        [str(find_ffmpeg_exe()), "-hide_banner", "-i", str(source)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        startupinfo=hidden_startupinfo(),
+        creationflags=hidden_creationflags(),
+    )
+    match = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", completed.stderr)
+    return int(match.group(2)) if match else None
+
+
+def gif_size_warning(source):
+    duration = media_duration_seconds(source) or 0
+    height = media_video_height(source) or 0
+    if duration >= 30 and height >= 1080:
+        return " Large GIF warning: long and high-resolution."
+    if duration >= 30:
+        return " Large GIF warning: long video."
+    if height >= 1080:
+        return " Large GIF warning: high-resolution video."
+    return ""
+
+
+def hidden_startupinfo():
     startupinfo = None
-    creationflags = 0
     if os.name == "nt":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        creationflags = subprocess.CREATE_NO_WINDOW
+    return startupinfo
+
+
+def hidden_creationflags():
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def run_ffmpeg(args, return_output=False, progress_callback=None, duration_seconds=None, cancel_event=None):
+    startupinfo = hidden_startupinfo()
+    creationflags = hidden_creationflags()
+
+    if cancel_event is not None:
+        command = list(args)
+        progress_updates = queue.Queue()
+        stderr_reader = None
+
+        if progress_callback is not None and duration_seconds:
+            command = [command[0], "-progress", "pipe:2", "-nostats", *command[1:]]
+
+            def read_progress(stream):
+                for raw_line in iter(stream.readline, b""):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                        try:
+                            progress_updates.put(float(line.partition("=")[2]) / 1_000_000)
+                        except ValueError:
+                            pass
+                    elif line.startswith("out_time="):
+                        match = re.fullmatch(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                        if match:
+                            hours, minutes, seconds = match.groups()
+                            progress_updates.put(int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE if progress_callback is not None and duration_seconds else subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+        if process.stderr is not None:
+            stderr_reader = threading.Thread(target=read_progress, args=(process.stderr,), daemon=True)
+            stderr_reader.start()
+        cancelled = False
+        last_percent = -1.0
+        try:
+            while process.poll() is None:
+                if cancel_event.is_set():
+                    cancelled = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    break
+                if progress_callback is None or not duration_seconds:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    elapsed = progress_updates.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                percent = min(100.0, elapsed / duration_seconds * 100)
+                if percent - last_percent >= 0.25:
+                    progress_callback(percent)
+                    last_percent = percent
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if stderr_reader is not None:
+                stderr_reader.join(timeout=2)
+            if process.stderr is not None:
+                process.stderr.close()
+        if cancelled:
+            raise get_download_cancelled()("Download cancelled.")
+        if process.returncode != 0:
+            raise RuntimeError("FFmpeg failed while converting media.")
+        if progress_callback is not None and duration_seconds:
+            progress_callback(100)
+        return None
 
     completed = subprocess.run(
         args,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         startupinfo=startupinfo,
         creationflags=creationflags,
     )
@@ -1612,7 +1724,19 @@ class DownloadBridge:
 
     def emit(self, event):
         with self.output_lock:
-            print(json.dumps(event, ensure_ascii=True), flush=True)
+            message = json.dumps(event, ensure_ascii=True)
+            if event.get("type") == "state":
+                state_path = os.environ.get("MEDIA_DOWNLOADER_STATE_PATH")
+                if state_path:
+                    target = Path(state_path)
+                    temporary = target.with_suffix(".tmp")
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        temporary.write_text(message, encoding="utf-8")
+                        os.replace(temporary, target)
+                    except OSError:
+                        pass
+            print(message, flush=True)
 
     def run(self):
         self.emit({"type": "ready"})
@@ -1624,15 +1748,33 @@ class DownloadBridge:
 
             action = message.get("action")
             if action == "start":
-                self.start(message.get("input", ""), message.get("mode", "video"))
+                self.start(message.get("input", ""), message.get("mode", "video"), message.get("outputName", ""))
+            elif action == "inspect":
+                self.inspect(message.get("input", ""), message.get("requestId"))
             elif action == "cancel":
                 self.cancel_event.set()
-                self.emit({"type": "state", "phase": "downloading", "status": "Cancelling download..."})
+                self.emit({"type": "state", "phase": "cancelling", "status": "Stopping conversion...", "indeterminate": True})
             elif action == "shutdown":
                 self.cancel_event.set()
+                if self.worker and self.worker.is_alive():
+                    self.worker.join(timeout=4)
                 return
 
-    def start(self, input_text, mode):
+    def inspect(self, input_text, request_id):
+        threading.Thread(target=self._inspect_worker, args=(input_text, request_id), daemon=True).start()
+
+    def _inspect_worker(self, input_text, request_id):
+        try:
+            def report_collection_progress(found, total):
+                status = f"Detecting videos: {found}/{total}" if total else f"Detecting videos: {found} found"
+                self.emit({"type": "previewProgress", "requestId": request_id, "status": status})
+
+            name, message, quality, entries = inspect_output_name(input_text, report_collection_progress)
+        except Exception:
+            name, message, quality, entries = None, "Default filename could not be read.", None, []
+        self.emit({"type": "preview", "requestId": request_id, "name": name, "message": message, "quality": quality, "entries": entries})
+
+    def start(self, input_text, mode, output_name=""):
         if self.worker and self.worker.is_alive():
             self.emit({"type": "error", "message": "A download is already running."})
             return
@@ -1640,6 +1782,9 @@ class DownloadBridge:
         urls = extract_urls(input_text)
         local_files = extract_local_files(input_text, urls)
         validation_error = validate_inputs(urls, local_files)
+        validation_error = validation_error or validate_output_name(output_name)
+        if mode == "fix-video" and (not local_files or urls):
+            validation_error = validation_error or "Fix Video works with a selected or dropped video file."
         if validation_error:
             self.emit({"type": "error", "message": validation_error})
             return
@@ -1660,22 +1805,24 @@ class DownloadBridge:
                 "indeterminate": False,
             }
         )
-        self.worker = threading.Thread(target=self._download_worker, args=(urls, local_files, mode), daemon=True)
+        self.worker = threading.Thread(target=self._download_worker, args=(urls, local_files, mode, output_name), daemon=True)
         self.worker.start()
 
-    def _download_worker(self, urls, local_files, mode):
+    def _download_worker(self, urls, local_files, mode, output_name):
         try:
             outputs = []
             if local_files:
-                outputs.append(process_local_files(local_files, mode, self._status, self.cancel_event))
-            if mode == "video":
-                output = download_best_video(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+                outputs.append(process_local_files(local_files, mode, self._status, self.cancel_event, self._conversion_progress, output_name))
+            if mode == "fix-video":
+                output = None
+            elif mode == "video":
+                output = download_best_video(urls, self._progress_hook, self._status, self.cancel_event, output_name) if urls else None
             elif mode == "gif":
-                output = download_best_gifs(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
-            elif mode == "frames":
-                output = download_best_frames(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+                output = download_best_gifs(urls, self._progress_hook, self._status, self.cancel_event, self._conversion_progress, output_name) if urls else None
+            elif mode in {"frames", "frame-first", "frames-similar"}:
+                output = download_best_frames(urls, self._progress_hook, self._status, self.cancel_event, self._conversion_progress, first_frame=mode == "frame-first", similar_frames=mode == "frames-similar", output_name=output_name) if urls else None
             else:
-                output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event) if urls else None
+                output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event, self._conversion_progress, output_name) if urls else None
             if output:
                 outputs.append(output)
             self.emit({"type": "state", "phase": "done", "status": f"Saved: {'; '.join(outputs)}", "progress": 100})
@@ -1685,8 +1832,20 @@ class DownloadBridge:
             self.emit({"type": "error", "message": str(exc)})
 
     def _status(self, text):
-        phase = "extracting" if "Extracting" in text else "converting" if "Converting" in text else "downloading"
-        self.emit({"type": "state", "phase": phase, "status": text})
+        phase = "extracting" if "Extracting" in text else "converting" if any(marker in text for marker in ("Converting", "Generating GIF", "Rendering GIF", "Repairing")) else "downloading"
+        event = {"type": "state", "phase": phase, "status": text}
+        if phase == "converting":
+            event["indeterminate"] = True
+        self.emit(event)
+
+    def _conversion_progress(self, percent, status, phase="converting"):
+        event = {"type": "state", "phase": phase, "status": status}
+        if percent is None:
+            event["indeterminate"] = True
+        else:
+            event["progress"] = max(0, min(100, percent))
+            event["indeterminate"] = False
+        self.emit(event)
 
     def _progress_hook(self, data):
         if self.cancel_event.is_set():
@@ -1743,8 +1902,5 @@ class DownloadBridge:
 
 
 if __name__ == "__main__":
-    if "--bridge" in sys.argv:
-        DownloadBridge().run()
-    else:
-        app = DownloadApp()
-        app.mainloop()
+    # The shipped app is Photino. Its host always launches this bridge.
+    DownloadBridge().run()
