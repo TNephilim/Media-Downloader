@@ -1,17 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
-hiddenimports = collect_submodules('yt_dlp') + [
+curl_datas, curl_binaries, curl_hiddenimports = collect_all('curl_cffi')
+phantomjs_binary = [('tools\\phantomjs.exe', '.')]
+
+hiddenimports = collect_submodules('yt_dlp') + curl_hiddenimports + [
     'imageio_ffmpeg',
     'PIL.Image',
 ]
-datas = collect_data_files('imageio_ffmpeg')
+datas = collect_data_files('imageio_ffmpeg') + curl_datas
 
 a = Analysis(
     ['src\\media_downloader.py'],
     pathex=[],
-    binaries=[],
+    binaries=curl_binaries + phantomjs_binary,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

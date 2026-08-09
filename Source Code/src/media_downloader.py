@@ -14,9 +14,14 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.2.2"
 TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
+PLAYLIST_STATE_DIRECTORY = ".media-downloader"
+PLAYLIST_MANIFEST_FILENAME = "playlist.json"
+PLAYLIST_VIDEO_ARCHIVE_FILENAME = "completed-video-entries.txt"
+RATE_LIMIT_BACKOFF_SECONDS = (15, 45)
+MAX_VIDEO_FORMAT = "bv*[height<=1080][fps<=60]+ba/b[height<=1080][fps<=60]"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 _YT_DLP = None
 _YT_DLP_UTILS = None
@@ -81,7 +86,10 @@ def inspect_output_name(input_text, collection_progress_callback=None):
         return fallback_output_name(fallback), None, quality or "No video detected", []
     if collection_title(info):
         summary, entries = format_playlist_details(info)
-        return safe_folder_name(str(collection_title(info))), None, summary, entries
+        folder_name = safe_folder_name(str(collection_title(info)))
+        if find_resumable_playlist_directory(urls[0], folder_name):
+            summary = f"{summary} · Resume available"
+        return folder_name, None, summary, entries
     title = safe_folder_name(str(info.get("title") or "Media Download"))
     return f"{title}.mp4", None, format_media_details(info), []
 
@@ -299,11 +307,25 @@ def validate_inputs(urls, local_files):
 
 def get_yt_dlp():
     global _YT_DLP
+    configure_bundled_tools()
     if _YT_DLP is None:
         import yt_dlp
 
         _YT_DLP = yt_dlp
     return _YT_DLP
+
+
+def configure_bundled_tools():
+    if getattr(sys, "frozen", False):
+        tools_directory = Path(getattr(sys, "_MEIPASS", ""))
+    else:
+        tools_directory = Path(__file__).resolve().parent.parent / "tools"
+
+    phantomjs = tools_directory / "phantomjs.exe"
+    if phantomjs.is_file():
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if str(tools_directory) not in path_entries:
+            os.environ["PATH"] = f"{tools_directory}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
 def get_ytdlp_utils():
@@ -332,9 +354,11 @@ def make_ydl_options(
     progress_hook,
     output_template,
     allow_playlists=True,
-    format_selector="bv*+ba/best",
+    format_selector=MAX_VIDEO_FORMAT,
     format_sort=None,
     merge_output_format="mp4",
+    source_url=None,
+    download_archive=None,
 ):
     ffmpeg_exe = find_ffmpeg_exe()
     options = {
@@ -351,7 +375,57 @@ def make_ydl_options(
         options["format_sort"] = format_sort
     if merge_output_format:
         options["merge_output_format"] = merge_output_format
+    if download_archive:
+        options["download_archive"] = str(download_archive)
+        options["continuedl"] = True
+        options["nopart"] = False
+    add_site_request_options(options, source_url)
     return options
+
+
+def is_rate_limited_error(error):
+    message = str(error).lower()
+    return "429" in message or "too many requests" in message or "rate limit" in message
+
+
+def wait_for_retry(seconds, cancel_event, status_callback, attempt):
+    remaining = int(seconds)
+    while remaining > 0:
+        check_cancelled(cancel_event)
+        status_callback(f"Rate limited. Waiting {remaining}s before retry {attempt}/{len(RATE_LIMIT_BACKOFF_SECONDS)}...")
+        time.sleep(1)
+        remaining -= 1
+
+
+def download_with_rate_limit(options, url, cancel_event, status_callback):
+    for attempt, delay in enumerate((*RATE_LIMIT_BACKOFF_SECONDS, None), start=1):
+        check_cancelled(cancel_event)
+        try:
+            with get_yt_dlp().YoutubeDL(options) as ydl:
+                code = ydl.download([url])
+            if code:
+                raise RuntimeError("One or more downloads failed.")
+            return
+        except Exception as exc:
+            if delay is None or not is_rate_limited_error(exc):
+                raise
+            wait_for_retry(delay, cancel_event, status_callback, attempt)
+
+
+def is_pornhub_url(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host == "pornhub.com" or host.endswith(".pornhub.com")
+
+
+def add_site_request_options(options, url):
+    if not url or not is_pornhub_url(url):
+        return
+
+    # This site can return a JavaScript verification page to a plain Python
+    # request. Use yt-dlp's supported browser profile instead of PhantomJS.
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+
+    options["impersonate"] = ImpersonateTarget.from_str("chrome-110:windows-10")
 
 
 def download_best_video(urls, progress_hook, status_callback, cancel_event, output_name=None):
@@ -364,21 +438,21 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event, outp
         options = make_ydl_options(
             progress_hook,
             output_template,
-            format_selector="bv*+ba/best",
+            format_selector=MAX_VIDEO_FORMAT,
             format_sort=["res", "fps", "br"],
             merge_output_format="mp4",
+            source_url=target["url"],
+            download_archive=target.get("archive"),
         )
 
         if target["is_collection"]:
-            status_callback(f"Downloading {target['name']} into {target['directory'].name}...")
+            action = "Resuming" if target.get("is_resume") else "Downloading"
+            status_callback(f"{action} {target['name']} into {target['directory'].name}...")
         else:
             status_callback("Downloading best available video...")
 
         try:
-            with get_yt_dlp().YoutubeDL(options) as ydl:
-                code = ydl.download([target["url"]])
-            if code:
-                raise RuntimeError("One or more downloads failed.")
+            download_with_rate_limit(options, target["url"], cancel_event, status_callback)
         except Exception:
             fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
             if not fallback:
@@ -489,8 +563,10 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event, conve
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_selector="best",
+                format_selector=MAX_VIDEO_FORMAT,
+                format_sort=["res", "fps", "br"],
                 merge_output_format=None,
+                source_url=target["url"],
             )
 
             if target["is_collection"]:
@@ -499,10 +575,7 @@ def download_best_gifs(urls, progress_hook, status_callback, cancel_event, conve
                 status_callback("Downloading source media for GIF conversion...")
 
             try:
-                with get_yt_dlp().YoutubeDL(options) as ydl:
-                    code = ydl.download([target["url"]])
-                if code:
-                    raise RuntimeError("One or more downloads failed before GIF conversion.")
+                download_with_rate_limit(options, target["url"], cancel_event, status_callback)
             except Exception:
                 fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
                 if not fallback:
@@ -575,8 +648,10 @@ def download_best_frames(urls, progress_hook, status_callback, cancel_event, con
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_selector="best",
+                format_selector=MAX_VIDEO_FORMAT,
+                format_sort=["res", "fps", "br"],
                 merge_output_format=None,
+                source_url=target["url"],
             )
 
             if target["is_collection"]:
@@ -585,10 +660,7 @@ def download_best_frames(urls, progress_hook, status_callback, cancel_event, con
                 status_callback("Downloading source media for frame extraction...")
 
             try:
-                with get_yt_dlp().YoutubeDL(options) as ydl:
-                    code = ydl.download([target["url"]])
-                if code:
-                    raise RuntimeError("One or more downloads failed before frame extraction.")
+                download_with_rate_limit(options, target["url"], cancel_event, status_callback)
             except Exception:
                 fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
                 if not fallback:
@@ -636,8 +708,9 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event, conve
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_selector="ba/bestaudio/best",
+                format_selector="ba/bestaudio/b[height<=1080][fps<=60]",
                 merge_output_format=None,
+                source_url=target["url"],
             )
 
             if target["is_collection"]:
@@ -646,10 +719,7 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event, conve
                 status_callback("Downloading audio for MP3 conversion...")
 
             try:
-                with get_yt_dlp().YoutubeDL(options) as ydl:
-                    code = ydl.download([target["url"]])
-                if code:
-                    raise RuntimeError("One or more downloads failed before MP3 conversion.")
+                download_with_rate_limit(options, target["url"], cancel_event, status_callback)
             except Exception:
                 fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
                 if not fallback:
@@ -714,9 +784,7 @@ def resolve_download_target(url, status_callback, mode, output_name=None):
     # through yt-dlp's playlist path without another full metadata scan.
     if output_name:
         folder_name = custom_folder_name(output_name)
-        directory = unique_path(DOWNLOAD_DIR / folder_name)
-        directory.mkdir(parents=True, exist_ok=True)
-        return {"directory": directory, "is_collection": True, "name": folder_name, "url": normalized_url}
+        return prepare_playlist_target(normalized_url, folder_name, mode == "video")
 
     status_callback("Scanning link details...")
     try:
@@ -730,9 +798,9 @@ def resolve_download_target(url, status_callback, mode, output_name=None):
     collection_name = collection_title(info)
     if collection_name:
         folder_name = custom_folder_name(output_name) if output_name else safe_folder_name(collection_name)
-        directory = unique_path(DOWNLOAD_DIR / folder_name)
-        directory.mkdir(parents=True, exist_ok=True)
-        return {"directory": directory, "is_collection": True, "name": collection_name, "url": normalized_url}
+        target = prepare_playlist_target(normalized_url, folder_name, mode == "video")
+        target["name"] = collection_name
+        return target
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": normalized_url}
 
@@ -752,9 +820,9 @@ def resolve_legacy_youtube_playlist_target(url, status_callback, mode, output_na
     collection_name = collection_title(info)
     if collection_name:
         folder_name = custom_folder_name(output_name) if output_name else safe_folder_name(collection_name)
-        directory = unique_path(DOWNLOAD_DIR / folder_name)
-        directory.mkdir(parents=True, exist_ok=True)
-        return {"directory": directory, "is_collection": True, "name": collection_name, "url": url}
+        target = prepare_playlist_target(url, folder_name, mode == "video")
+        target["name"] = collection_name
+        return target
 
     return fast_download_target(url)
 
@@ -762,6 +830,82 @@ def resolve_legacy_youtube_playlist_target(url, status_callback, mode, output_na
 def fast_download_target(url):
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return {"directory": DOWNLOAD_DIR, "is_collection": False, "name": None, "url": url}
+
+
+def playlist_state_path(directory):
+    return Path(directory) / PLAYLIST_STATE_DIRECTORY
+
+
+def playlist_manifest_path(directory):
+    return playlist_state_path(directory) / PLAYLIST_MANIFEST_FILENAME
+
+
+def hide_from_windows(path):
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2)
+    except Exception:
+        pass
+
+
+def read_playlist_manifest(directory):
+    try:
+        with playlist_manifest_path(directory).open("r", encoding="utf-8") as file:
+            manifest = json.load(file)
+    except (OSError, ValueError, TypeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def has_legacy_playlist_files(directory):
+    try:
+        return any(re.match(r"^\d{3} - .+", child.name) for child in directory.iterdir())
+    except OSError:
+        return False
+
+
+def find_resumable_playlist_directory(url, fallback_folder_name=None):
+    normalized_url = normalize_media_url(url)
+    if not DOWNLOAD_DIR.is_dir():
+        return None
+    try:
+        directories = list(DOWNLOAD_DIR.iterdir())
+    except OSError:
+        return None
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        manifest = read_playlist_manifest(directory)
+        if manifest and manifest.get("url") == normalized_url:
+            return directory
+    if fallback_folder_name:
+        legacy_directory = DOWNLOAD_DIR / fallback_folder_name
+        if legacy_directory.is_dir() and has_legacy_playlist_files(legacy_directory):
+            return legacy_directory
+    return None
+
+
+def prepare_playlist_target(url, folder_name, allow_resume):
+    normalized_url = normalize_media_url(url)
+    existing_directory = find_resumable_playlist_directory(normalized_url, folder_name) if allow_resume else None
+    is_resume = existing_directory is not None
+    directory = existing_directory or unique_path(DOWNLOAD_DIR / folder_name)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    state_directory = playlist_state_path(directory)
+    state_directory.mkdir(exist_ok=True)
+    manifest_path = playlist_manifest_path(directory)
+    if not manifest_path.exists():
+        manifest_path.write_text(json.dumps({"url": normalized_url}, ensure_ascii=True), encoding="utf-8")
+    hide_from_windows(state_directory)
+
+    target = {"directory": directory, "is_collection": True, "name": folder_name, "url": normalized_url, "is_resume": is_resume}
+    if allow_resume:
+        target["archive"] = state_directory / PLAYLIST_VIDEO_ARCHIVE_FILENAME
+    return target
 
 
 def is_probable_collection_url(url):
@@ -814,6 +958,7 @@ def extract_download_info(url, collection_progress_callback=None):
     # video. The actual download still uses the normal highest-quality path.
     if collection_progress_callback and is_probable_collection_url(url):
         options["extract_flat"] = "in_playlist"
+    add_site_request_options(options, url)
     ydl_class = get_yt_dlp().YoutubeDL
     if collection_progress_callback:
         base_class = ydl_class
@@ -1716,6 +1861,7 @@ def run_ffmpeg(args, return_output=False, progress_callback=None, duration_secon
 class DownloadBridge:
     def __init__(self):
         self.cancel_event = threading.Event()
+        self.shutting_down = threading.Event()
         self.worker = None
         self.output_lock = threading.Lock()
         self.download_total = 0
@@ -1724,6 +1870,8 @@ class DownloadBridge:
 
     def emit(self, event):
         with self.output_lock:
+            if self.shutting_down.is_set():
+                return
             message = json.dumps(event, ensure_ascii=True)
             if event.get("type") == "state":
                 state_path = os.environ.get("MEDIA_DOWNLOADER_STATE_PATH")
@@ -1755,6 +1903,11 @@ class DownloadBridge:
                 self.cancel_event.set()
                 self.emit({"type": "state", "phase": "cancelling", "status": "Stopping conversion...", "indeterminate": True})
             elif action == "shutdown":
+                self.shutting_down.set()
+                # Wait for an in-flight emit to finish before the Python
+                # runtime starts closing stdout under preview worker threads.
+                with self.output_lock:
+                    pass
                 self.cancel_event.set()
                 if self.worker and self.worker.is_alive():
                     self.worker.join(timeout=4)
@@ -1834,7 +1987,7 @@ class DownloadBridge:
     def _status(self, text):
         phase = "extracting" if "Extracting" in text else "converting" if any(marker in text for marker in ("Converting", "Generating GIF", "Rendering GIF", "Repairing")) else "downloading"
         event = {"type": "state", "phase": phase, "status": text}
-        if phase == "converting":
+        if phase == "converting" or text.startswith("Rate limited."):
             event["indeterminate"] = True
         self.emit(event)
 
@@ -1860,8 +2013,12 @@ class DownloadBridge:
             speed = data.get("_speed_str", "").strip()
             if total:
                 item_percent = downloaded / total * 100
-                message = f"{count}Downloading... {item_percent:.1f}% {speed}".strip()
-                self.emit({"type": "state", "phase": "downloading", "status": message, "progress": self._overall_progress(item_percent), "indeterminate": False})
+                overall_percent = self._overall_progress(item_percent)
+                if self.download_total > 1:
+                    message = f"{count}Overall {overall_percent:.1f}% - current video {item_percent:.1f}% {speed}".strip()
+                else:
+                    message = f"Downloading... {item_percent:.1f}% {speed}".strip()
+                self.emit({"type": "state", "phase": "downloading", "status": message, "progress": overall_percent, "indeterminate": False})
             else:
                 message = f"{count}Downloading... {format_download_size(downloaded)} received {speed}".strip()
                 self.emit({"type": "state", "phase": "downloading", "status": message, "indeterminate": True})
