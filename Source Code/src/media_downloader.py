@@ -9,19 +9,26 @@ import sys
 import threading
 import tempfile
 import time
+import hashlib
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
+APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Media Downloader"
+PLAYLIST_WORK_ROOT = APP_DATA_DIR / "Playlist Downloads"
 PLAYLIST_STATE_DIRECTORY = ".media-downloader"
 PLAYLIST_MANIFEST_FILENAME = "playlist.json"
 PLAYLIST_VIDEO_ARCHIVE_FILENAME = "completed-video-entries.txt"
 RATE_LIMIT_BACKOFF_SECONDS = (15, 45)
-MAX_VIDEO_FORMAT = "bv*[height<=1080][fps<=60]+ba/b[height<=1080][fps<=60]"
+STREAM_SOCKET_TIMEOUT_SECONDS = 30
+STREAM_RETRY_COUNT = 2
+# Some sites omit height or FPS from otherwise valid streams. The `?` keeps
+# those unknown values eligible while still excluding known 4K or >60 fps media.
+MAX_VIDEO_FORMAT = "bv*[height<=?1080][fps<=?60]+ba/b[height<=?1080][fps<=?60]"
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 _YT_DLP = None
 _YT_DLP_UTILS = None
@@ -40,6 +47,8 @@ MEDIA_SOURCE_SUFFIXES = {
     ".webm",
 }
 VIDEO_SOURCE_SUFFIXES = {".mp4", ".webm", ".mkv", ".mov"}
+FRAME_SOURCE_SUFFIXES = VIDEO_SOURCE_SUFFIXES | {".gif"}
+LOCAL_FILE_SUFFIXES = MEDIA_SOURCE_SUFFIXES | {".gif"}
 def extract_urls(text):
     urls = []
     for match in URL_PATTERN.findall(text):
@@ -66,15 +75,15 @@ def inspect_output_name(input_text, collection_progress_callback=None):
     urls = extract_urls(input_text)
     local_files = extract_local_files(input_text, urls)
     if len(local_files) == 1 and not urls:
-        return local_files[0].name, None, format_local_media_details(local_files[0]), []
+        return local_files[0].name, None, format_local_media_details(local_files[0]), [], False
     if len(urls) != 1 or local_files:
-        return None, "Paste one video link or choose one media file to load a default filename.", None, []
+        return None, "Paste one video link or choose one media file to load a default filename.", None, [], False
 
     if is_x_or_twitter_url(urls[0]):
         fallback = extract_twitter_fallback(urls[0])
         if fallback:
             quality = fallback.get("quality") or probe_media_quality(fallback["video_url"])
-            return fallback_output_name(fallback), None, quality or "No video detected", []
+            return fallback_output_name(fallback), None, quality or "No video detected", [], False
 
     try:
         info = extract_download_info(urls[0], collection_progress_callback)
@@ -83,15 +92,16 @@ def inspect_output_name(input_text, collection_progress_callback=None):
         if not fallback:
             raise
         quality = fallback.get("quality") or probe_media_quality(fallback["video_url"])
-        return fallback_output_name(fallback), None, quality or "No video detected", []
+        return fallback_output_name(fallback), None, quality or "No video detected", [], False
     if collection_title(info):
         summary, entries = format_playlist_details(info)
         folder_name = safe_folder_name(str(collection_title(info)))
-        if find_resumable_playlist_directory(urls[0], folder_name):
+        resume_available = find_resumable_playlist_directory(urls[0], folder_name) is not None
+        if resume_available:
             summary = f"{summary} · Resume available"
-        return folder_name, None, summary, entries
+        return folder_name, None, summary, entries, resume_available
     title = safe_folder_name(str(info.get("title") or "Media Download"))
-    return f"{title}.mp4", None, format_media_details(info), []
+    return f"{title}.mp4", None, format_media_details(info), [], False
 
 
 def format_duration(seconds):
@@ -370,6 +380,11 @@ def make_ydl_options(
         "no_warnings": True,
         "progress_hooks": [progress_hook],
         "windowsfilenames": True,
+        # A stalled CDN connection otherwise leaves yt-dlp blocked at its last
+        # reported percentage indefinitely. Retry a little, then return an error.
+        "socket_timeout": STREAM_SOCKET_TIMEOUT_SECONDS,
+        "retries": STREAM_RETRY_COUNT,
+        "fragment_retries": STREAM_RETRY_COUNT,
     }
     if format_sort:
         options["format_sort"] = format_sort
@@ -434,7 +449,7 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event, outp
         check_cancelled(cancel_event)
         target = resolve_download_target(url, status_callback, "video", output_name)
         check_cancelled(cancel_event)
-        output_template = target["directory"] / output_filename_template(target["is_collection"], output_name)
+        output_template = target.get("work_directory", target["directory"]) / output_filename_template(target["is_collection"], output_name)
         options = make_ydl_options(
             progress_hook,
             output_template,
@@ -453,6 +468,7 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event, outp
 
         try:
             download_with_rate_limit(options, target["url"], cancel_event, status_callback)
+            finalize_playlist_staging(target, status_callback)
         except Exception:
             fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
             if not fallback:
@@ -475,7 +491,20 @@ def process_local_files(files, mode, status_callback, cancel_event, conversion_c
             if suffix not in VIDEO_SOURCE_SUFFIXES:
                 raise RuntimeError(f"{file_path.name} is not a supported video file to repair.")
             status_callback(f"Repairing video {index}/{total}...")
-            outputs.append(repair_video_for_playback(file_path, replace_original=False, output_name=output_name))
+            def report_repair_progress(percent, repair_status):
+                if conversion_callback is not None:
+                    conversion_callback(percent, f"{repair_status} {percent:.0f}%")
+
+            outputs.append(
+                repair_video_for_playback(
+                    file_path,
+                    replace_original=False,
+                    output_name=output_name,
+                    output_directory=DOWNLOAD_DIR,
+                    progress_callback=report_repair_progress if conversion_callback else None,
+                    cancel_event=cancel_event,
+                )
+            )
         elif mode == "video":
             if suffix == ".gif":
                 conversion_status = f"Converting GIF to video {index}/{total}..."
@@ -483,7 +512,7 @@ def process_local_files(files, mode, status_callback, cancel_event, conversion_c
                 outputs.append(
                     convert_gif_to_video(
                         file_path,
-                        file_path.parent,
+                        DOWNLOAD_DIR,
                         progress_callback=(lambda percent, status=conversion_status: conversion_callback(percent, f"{status} {percent:.0f}%")) if conversion_callback else None,
                         cancel_event=cancel_event,
                     )
@@ -506,7 +535,7 @@ def process_local_files(files, mode, status_callback, cancel_event, conversion_c
             outputs.append(
                 convert_source_to_gif(
                     file_path,
-                    file_path.parent,
+                    DOWNLOAD_DIR,
                     delete_source=False,
                     progress_callback=report_local_progress if conversion_callback else None,
                     cancel_event=cancel_event,
@@ -538,7 +567,7 @@ def process_local_files(files, mode, status_callback, cancel_event, conversion_c
             outputs.append(
                 convert_source_to_mp3(
                     file_path,
-                    file_path.parent,
+                    DOWNLOAD_DIR,
                     delete_source=False,
                     progress_callback=(lambda percent, status=conversion_status: conversion_callback(percent, f"{status} {percent:.0f}%")) if conversion_callback else None,
                     cancel_event=cancel_event,
@@ -708,7 +737,7 @@ def download_best_mp3s(urls, progress_hook, status_callback, cancel_event, conve
             options = make_ydl_options(
                 progress_hook,
                 temp_template,
-                format_selector="ba/bestaudio/b[height<=1080][fps<=60]",
+                format_selector="ba/bestaudio/b[height<=?1080][fps<=?60]",
                 merge_output_format=None,
                 source_url=target["url"],
             )
@@ -840,6 +869,11 @@ def playlist_manifest_path(directory):
     return playlist_state_path(directory) / PLAYLIST_MANIFEST_FILENAME
 
 
+def playlist_work_directory(url):
+    key = hashlib.sha256(normalize_media_url(url).encode("utf-8")).hexdigest()[:24]
+    return PLAYLIST_WORK_ROOT / key
+
+
 def hide_from_windows(path):
     if os.name != "nt":
         return
@@ -895,17 +929,53 @@ def prepare_playlist_target(url, folder_name, allow_resume):
     directory = existing_directory or unique_path(DOWNLOAD_DIR / folder_name)
     directory.mkdir(parents=True, exist_ok=True)
 
+    existing_manifest = read_playlist_manifest(directory)
+    existing_work_directory = existing_manifest.get("work_directory") if isinstance(existing_manifest, dict) else None
+    use_staging = allow_resume and not is_resume
+    work_directory = Path(existing_work_directory) if existing_work_directory else (playlist_work_directory(normalized_url) if use_staging else directory)
+    work_directory.mkdir(parents=True, exist_ok=True)
+
     state_directory = playlist_state_path(directory)
     state_directory.mkdir(exist_ok=True)
     manifest_path = playlist_manifest_path(directory)
     if not manifest_path.exists():
-        manifest_path.write_text(json.dumps({"url": normalized_url}, ensure_ascii=True), encoding="utf-8")
+        manifest = {"url": normalized_url}
+        if work_directory != directory:
+            manifest["work_directory"] = str(work_directory)
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
     hide_from_windows(state_directory)
 
-    target = {"directory": directory, "is_collection": True, "name": folder_name, "url": normalized_url, "is_resume": is_resume}
+    target = {
+        "directory": directory,
+        "work_directory": work_directory,
+        "is_collection": True,
+        "name": folder_name,
+        "url": normalized_url,
+        "is_resume": is_resume,
+    }
     if allow_resume:
-        target["archive"] = state_directory / PLAYLIST_VIDEO_ARCHIVE_FILENAME
+        work_state_directory = playlist_state_path(work_directory)
+        work_state_directory.mkdir(exist_ok=True)
+        hide_from_windows(work_state_directory)
+        target["archive"] = work_state_directory / PLAYLIST_VIDEO_ARCHIVE_FILENAME
     return target
+
+
+def finalize_playlist_staging(target, status_callback):
+    work_directory = target.get("work_directory")
+    final_directory = target.get("directory")
+    if not target.get("is_collection") or not work_directory or Path(work_directory) == Path(final_directory):
+        return
+
+    status_callback("Saving completed playlist files...")
+    for source in Path(work_directory).iterdir():
+        if source.name == PLAYLIST_STATE_DIRECTORY or not source.is_file():
+            continue
+        destination = Path(final_directory) / source.name
+        if destination.exists():
+            source.unlink(missing_ok=True)
+        else:
+            shutil.move(str(source), str(destination))
 
 
 def is_probable_collection_url(url):
@@ -1241,17 +1311,32 @@ def collection_title(info):
 
 
 def safe_folder_name(name):
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", strip_emojis(str(name)))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     return cleaned or "Media Download"
 
 
+def strip_emojis(value):
+    def is_emoji(character):
+        code_point = ord(character)
+        return (
+            0x1F000 <= code_point <= 0x1FAFF
+            or 0x2600 <= code_point <= 0x27BF
+            or code_point in {0x200D, 0x20E3, 0xFE0F}
+        )
+
+    return "".join(character for character in value if not is_emoji(character))
+
+
 def custom_output_stem(output_name):
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", output_name.strip()).rstrip(". ")
-    return Path(cleaned).stem
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", strip_emojis(output_name))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(". ")
+    # Keep default post titles below Windows' full-path limit in Downloads.
+    return Path(cleaned).stem[:180].rstrip(". ") or "Media Download"
 
 
 def custom_folder_name(output_name):
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", output_name.strip()).rstrip(". ")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", strip_emojis(output_name).strip()).rstrip(". ")
     return cleaned or "Media Download"
 
 
@@ -1321,19 +1406,42 @@ def download_direct_media(url, output_path, progress_hook):
     return output_path
 
 
-def repair_video_for_playback(path, replace_original=True, output_name=None):
-    repaired = remux_video_lossless(path, replace_original=replace_original)
-    rebuilt = rebuild_video_for_playback(repaired, replace_original=True)
+def repair_video_for_playback(path, replace_original=True, output_name=None, output_directory=None, progress_callback=None, cancel_event=None):
+    def report_progress(start, end, label):
+        def callback(percent):
+            if progress_callback is not None:
+                progress_callback(start + (max(0, min(100, percent)) / 100 * (end - start)), label)
+        return callback
+
+    if progress_callback is not None:
+        progress_callback(0, "Repairing video timestamps...")
+    repaired = remux_video_lossless(
+        path,
+        replace_original=replace_original,
+        progress_callback=report_progress(0, 15, "Repairing video timestamps..."),
+        cancel_event=cancel_event,
+    )
+    if progress_callback is not None:
+        progress_callback(15, "Rebuilding video for playback...")
+    rebuilt = rebuild_video_for_playback(
+        repaired,
+        replace_original=True,
+        progress_callback=report_progress(15, 100, "Rebuilding video for playback..."),
+        cancel_event=cancel_event,
+    )
     finished = rebuilt or repaired
-    if not replace_original and output_name:
-        named_output = unique_path(path.with_name(f"{custom_output_stem(output_name)}{path.suffix}"))
+    if not replace_original:
+        destination = Path(output_directory) if output_directory is not None else path.parent
+        destination.mkdir(parents=True, exist_ok=True)
+        output_stem = custom_output_stem(output_name) if output_name else path.stem
+        named_output = unique_path(destination / f"{output_stem}{path.suffix}")
         if finished != named_output:
             finished.replace(named_output)
         return named_output
     return finished
 
 
-def remux_video_lossless(path, replace_original=True):
+def remux_video_lossless(path, replace_original=True, progress_callback=None, cancel_event=None):
     path = Path(path)
     if not path.exists() or path.suffix.lower() not in VIDEO_SOURCE_SUFFIXES:
         return path
@@ -1362,7 +1470,12 @@ def remux_video_lossless(path, replace_original=True):
     args.append(str(repaired))
 
     try:
-        run_ffmpeg(args)
+        run_ffmpeg(
+            args,
+            progress_callback=progress_callback,
+            duration_seconds=media_duration_seconds(path),
+            cancel_event=cancel_event,
+        )
         if replace_original:
             repaired.replace(path)
             return path
@@ -1377,7 +1490,7 @@ def remux_video_lossless(path, replace_original=True):
     return path
 
 
-def rebuild_video_for_playback(path, replace_original=True):
+def rebuild_video_for_playback(path, replace_original=True, progress_callback=None, cancel_event=None):
     path = Path(path)
     if not path.exists() or path.suffix.lower() not in VIDEO_SOURCE_SUFFIXES:
         return None
@@ -1422,7 +1535,12 @@ def rebuild_video_for_playback(path, replace_original=True):
     args.append(str(repaired))
 
     try:
-        run_ffmpeg(args)
+        run_ffmpeg(
+            args,
+            progress_callback=progress_callback,
+            duration_seconds=media_duration_seconds(path),
+            cancel_event=cancel_event,
+        )
         if replace_original:
             repaired.replace(path)
             return path
@@ -1922,10 +2040,10 @@ class DownloadBridge:
                 status = f"Detecting videos: {found}/{total}" if total else f"Detecting videos: {found} found"
                 self.emit({"type": "previewProgress", "requestId": request_id, "status": status})
 
-            name, message, quality, entries = inspect_output_name(input_text, report_collection_progress)
+            name, message, quality, entries, resume_available = inspect_output_name(input_text, report_collection_progress)
         except Exception:
-            name, message, quality, entries = None, "Default filename could not be read.", None, []
-        self.emit({"type": "preview", "requestId": request_id, "name": name, "message": message, "quality": quality, "entries": entries})
+            name, message, quality, entries, resume_available = None, "Default filename could not be read.", None, [], False
+        self.emit({"type": "preview", "requestId": request_id, "name": name, "message": message, "quality": quality, "entries": entries, "resumeAvailable": resume_available})
 
     def start(self, input_text, mode, output_name=""):
         if self.worker and self.worker.is_alive():
@@ -1978,10 +2096,13 @@ class DownloadBridge:
                 output = download_best_mp3s(urls, self._progress_hook, self._status, self.cancel_event, self._conversion_progress, output_name) if urls else None
             if output:
                 outputs.append(output)
+            self.worker = None
             self.emit({"type": "state", "phase": "done", "status": f"Saved: {'; '.join(outputs)}", "progress": 100})
         except get_download_cancelled():
+            self.worker = None
             self.emit({"type": "state", "phase": "cancelled", "status": "Download cancelled."})
         except Exception as exc:
+            self.worker = None
             self.emit({"type": "error", "message": str(exc)})
 
     def _status(self, text):

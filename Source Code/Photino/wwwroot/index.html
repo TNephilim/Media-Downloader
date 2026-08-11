@@ -82,7 +82,7 @@
 </head>
 <body>
   <main id="app">
-    <header><h1>Media Downloader</h1><span class="version">v1.2.2</span></header>
+    <header><h1>Media Downloader</h1><span class="version">v1.2.3</span></header>
     <section class="input-area" id="drop-zone">
       <textarea id="input" aria-label="Media link or file path" spellcheck="false" placeholder="Paste link or drop a file"></textarea>
       <div class="side-actions">
@@ -155,12 +155,17 @@
     const progress = document.querySelector('#progress');
     const cancel = document.querySelector('#cancel');
     const modeButtons = [...document.querySelectorAll('[data-mode]')];
+    const videoButton = modeButtons.find(button => button.dataset.mode === 'video');
     const framesButton = document.querySelector('#frames-button');
     const frameMenu = document.querySelector('#frame-menu');
     const frameOptionButtons = [...document.querySelectorAll('[data-frame-mode]')];
     const app = document.querySelector('#app');
     const send = payload => window.external.sendMessage(JSON.stringify(payload));
-    const sanitizeOutputName = () => { outputName.value = outputName.value.replace(/[<>:"/\\|?*\x00-\x1f]/g, ''); };
+    const sanitizeOutputName = () => {
+      outputName.value = outputName.value
+        .replace(/[<>:"/\\|?*\x00-\x1f\p{Extended_Pictographic}\u200D\u20E3\uFE0F]/gu, '')
+        .replace(/\s{2,}/g, ' ');
+    };
     const setDetailsMenuOpen = open => {
       detailsMenu.hidden = !open;
       send({ action: 'detailsMenu', open });
@@ -187,16 +192,53 @@
     let previewTimer;
     let previewRequestId = 0;
     let isBusy = false;
+    let waitingForLocalFilePreview = false;
+    const setResumeVideo = available => { videoButton.textContent = available ? 'Resume Video' : 'Download Video'; };
     const scheduleNamePreview = () => {
       clearTimeout(previewTimer);
       const requestId = ++previewRequestId;
       outputName.value = '';
+      setResumeVideo(false);
       outputName.placeholder = input.value.trim() ? 'Loading name...' : 'File name';
       setDetails(input.value.trim() ? 'Checking for video...' : 'No video detected');
       if (!input.value.trim()) return;
       previewTimer = setTimeout(() => send({ action: 'inspect', requestId, input: input.value }), 500);
     };
     const setFiles = files => { if (files?.length) { input.value = files.join('\n'); scheduleNamePreview(); } };
+    const chunkToBase64 = bytes => {
+      let binary = '';
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      }
+      return btoa(binary);
+    };
+    const importDroppedFiles = async files => {
+      const dropped = [...files];
+      if (!dropped.length) return;
+      for (const file of dropped) {
+        const id = crypto.randomUUID();
+        const chunkSize = 256 * 1024;
+        phase.textContent = 'IMPORTING FILE'; phase.className = 'state';
+        status.textContent = `Importing ${file.name}...`;
+        progress.className = 'progress-fill'; progress.style.width = '0%';
+        send({ action: 'importStart', id, name: file.name });
+        try {
+          for (let offset = 0; offset < file.size; offset += chunkSize) {
+            const bytes = new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer());
+            send({ action: 'importChunk', id, data: chunkToBase64(bytes) });
+            const percent = Math.min(100, (offset + bytes.length) / Math.max(file.size, 1) * 100);
+            status.textContent = `Importing ${file.name}... ${percent.toFixed(0)}%`;
+            progress.style.width = `${percent}%`;
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+          send({ action: 'importComplete', id });
+        } catch (error) {
+          send({ action: 'importCancel', id });
+          phase.textContent = 'DOWNLOAD FAILED'; phase.className = 'state error';
+          status.textContent = 'Unable to import the dropped file.';
+        }
+      }
+    };
 
     document.querySelector('#clear').onclick = () => { input.value = ''; scheduleNamePreview(); };
     document.querySelector('#paste').onclick = async () => { try { input.value = await navigator.clipboard.readText(); scheduleNamePreview(); } catch { } };
@@ -248,13 +290,22 @@
     ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); app.classList.add('drop-active'); }));
     ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => { event.preventDefault(); app.classList.remove('drop-active'); }));
     dropZone.addEventListener('drop', event => {
-      const paths = [...event.dataTransfer.files].map(file => file.path).filter(Boolean);
-      if (paths.length) send({ action: 'files', files: paths });
+      event.preventDefault();
+      importDroppedFiles(event.dataTransfer.files);
     });
 
     window.external.receiveMessage(message => {
       const event = JSON.parse(message);
-      if (event.type === 'files') { setFiles(event.files); return; }
+      if (event.type === 'files') {
+        waitingForLocalFilePreview = true;
+        setFiles(event.files);
+        phase.textContent = 'CHECKING FILE'; phase.className = 'state';
+        status.textContent = 'Reading dropped file...';
+        progress.className = 'progress-fill'; progress.style.width = '0%';
+        isBusy = false; cancel.disabled = true;
+        modeButtons.concat(frameOptionButtons).forEach(button => button.disabled = true);
+        return;
+      }
       if (event.type === 'previewProgress') {
         if (event.requestId !== previewRequestId) return;
         setDetails(event.status || 'Detecting videos...', []);
@@ -264,7 +315,14 @@
         if (event.requestId !== previewRequestId) return;
         outputName.value = event.name || '';
         outputName.placeholder = 'File name';
+        setResumeVideo(Boolean(event.resumeAvailable));
         setDetails(event.quality || 'No video detected', event.entries || []);
+        if (!isBusy) modeButtons.concat(frameOptionButtons).forEach(button => button.disabled = false);
+        if (waitingForLocalFilePreview) {
+            waitingForLocalFilePreview = false;
+            phase.textContent = 'READY'; phase.className = 'state done';
+            status.textContent = 'File ready.';
+        }
         return;
       }
       if (event.type === 'ready') return;
