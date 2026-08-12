@@ -403,6 +403,10 @@ def is_rate_limited_error(error):
     return "429" in message or "too many requests" in message or "rate limit" in message
 
 
+class XRateLimitFallbackRequested(RuntimeError):
+    """Lets a video download use X's alternate source before a long backoff."""
+
+
 def wait_for_retry(seconds, cancel_event, status_callback, attempt):
     remaining = int(seconds)
     while remaining > 0:
@@ -412,7 +416,7 @@ def wait_for_retry(seconds, cancel_event, status_callback, attempt):
         remaining -= 1
 
 
-def download_with_rate_limit(options, url, cancel_event, status_callback):
+def download_with_rate_limit(options, url, cancel_event, status_callback, prefer_x_fallback=False):
     for attempt, delay in enumerate((*RATE_LIMIT_BACKOFF_SECONDS, None), start=1):
         check_cancelled(cancel_event)
         try:
@@ -424,6 +428,8 @@ def download_with_rate_limit(options, url, cancel_event, status_callback):
         except Exception as exc:
             if delay is None or not is_rate_limited_error(exc):
                 raise
+            if prefer_x_fallback:
+                raise XRateLimitFallbackRequested() from exc
             wait_for_retry(delay, cancel_event, status_callback, attempt)
 
 
@@ -467,8 +473,36 @@ def download_best_video(urls, progress_hook, status_callback, cancel_event, outp
             status_callback("Downloading best available video...")
 
         try:
-            download_with_rate_limit(options, target["url"], cancel_event, status_callback)
+            download_with_rate_limit(
+                options,
+                target["url"],
+                cancel_event,
+                status_callback,
+                prefer_x_fallback=is_x_or_twitter_url(target["url"]),
+            )
             finalize_playlist_staging(target, status_callback)
+        except XRateLimitFallbackRequested:
+            # X sometimes limits an individual media endpoint while its public
+            # alternate source remains available. Prefer that direct stream so
+            # one post does not force the user through the 15/45-second waits.
+            fallback = extract_twitter_fallback(target["url"])
+            if fallback:
+                status_callback("X temporarily rate limited. Trying alternate video source...")
+                fallback_name = custom_output_stem(output_name) if output_name else custom_output_stem(fallback_output_name(fallback))
+                try:
+                    download_direct_media(fallback["video_url"], target["directory"] / f"{fallback_name}.mp4", progress_hook)
+                except get_download_cancelled():
+                    raise
+                except Exception:
+                    # The normal retry path remains available if the alternate
+                    # provider or its direct stream is temporarily unavailable.
+                    status_callback("Alternate source unavailable. Retrying X...")
+                    download_with_rate_limit(options, target["url"], cancel_event, status_callback)
+                    finalize_playlist_staging(target, status_callback)
+            else:
+                status_callback("Alternate source unavailable. Retrying X...")
+                download_with_rate_limit(options, target["url"], cancel_event, status_callback)
+                finalize_playlist_staging(target, status_callback)
         except Exception:
             fallback = extract_twitter_fallback(target["url"]) if is_x_or_twitter_url(target["url"]) else None
             if not fallback:
