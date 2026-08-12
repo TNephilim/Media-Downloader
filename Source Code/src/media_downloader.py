@@ -11,11 +11,12 @@ import tempfile
 import time
 import hashlib
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "Media Downloader"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 TWITIGER_EXTRACT_URL = "https://twitiger.com/api/extract?url="
 DOWNLOAD_DIR = Path.home() / "Downloads"
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Media Downloader"
